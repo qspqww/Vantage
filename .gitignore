@@ -1,0 +1,21 @@
+# Swift Package Manager build output
+.build/
+.swiftpm/
+
+# Xcode user and derived data
+DerivedData/
+*.xcodeproj/xcuserdata/
+*.xcworkspace/xcuserdata/
+*.xcuserstate
+
+# macOS metadata
+.DS_Store
+
+# Generated application bundles
+dist/
+*.app/
+
+# Editor and temporary files
+*.swp
+*.swo
+*~
