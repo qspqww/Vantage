@@ -171,7 +171,35 @@ final class OverlayWindowController: NSObject, ObservableObject {
         var newPanels: [OverlayPanel] = []
         for window in windows {
             if let panel = panels[window.id] {
-                panel.positionKey = window.overlayPositionKey
+                let oldKey = panel.positionKey
+                let newKey = window.overlayPositionKey
+                if oldKey != newKey {
+                    panel.positionKey = newKey
+                    // Character name appears later: existing panel title changed from placeholder to character name, migrate back to saved position.
+                    if let origin = settings.savedOverlayOrigin(for: newKey) {
+                        guard let screen = screenFor(origin: NSPoint(x: origin.x, y: origin.y)) ?? NSScreen.main else {
+                            continue
+                        }
+                        let size = NSSize(width: settings.previewWidth, height: settings.previewWidth * 0.625)
+                        let targetFrame = clampedFrame(
+                            origin: NSPoint(x: origin.x, y: origin.y),
+                            size: size,
+                            within: screen.visibleFrame
+                        )
+                        if hypot(panel.frame.origin.x - targetFrame.origin.x,
+                                  panel.frame.origin.y - targetFrame.origin.y) > 8 {
+                            isApplyingLayout = true
+                            panel.setFrame(targetFrame, display: true, animate: true)
+                            isApplyingLayout = false
+                            savePosition(of: panel, origin: targetFrame.origin)
+                        }
+                    } else {
+                        // First occurrence of new title: keep current position and persist for next launch.
+                        savePosition(of: panel, origin: panel.frame.origin)
+                    }
+                } else {
+                    panel.positionKey = newKey
+                }
             } else {
                 let panel = makePanel(for: window)
                 panels[window.id] = panel
@@ -307,8 +335,8 @@ final class OverlayWindowController: NSObject, ObservableObject {
     @objc private func activateWindowFromMenu(_ sender: NSMenuItem) {
         guard let number = sender.representedObject as? NSNumber else { return }
         let windowID = CGWindowID(number.uint32Value)
-        DispatchQueue.main.async { [weak self] in
-            self?.captureService.select(windowID)
+        Task { [weak self] in
+            await self?.captureService.select(windowID)
         }
     }
 

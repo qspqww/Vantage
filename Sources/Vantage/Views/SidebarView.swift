@@ -103,7 +103,7 @@ struct SidebarView: View {
         let isActive = captureService.activeWindowID == window.id
 
         return Button {
-            captureService.select(window.id)
+            Task { await captureService.select(window.id) }
         } label: {
             HStack(spacing: 8) {
                 Rectangle()

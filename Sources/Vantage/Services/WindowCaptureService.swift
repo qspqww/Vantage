@@ -15,6 +15,7 @@ final class WindowCaptureService: ObservableObject {
     private let settings: SettingsStore
     private var updateTask: Task<Void, Never>?
     private var refreshSequence = 0
+    private var lastActiveUpdate = Date.distantPast
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -25,7 +26,10 @@ final class WindowCaptureService: ObservableObject {
     }
 
     func start() {
-        guard updateTask == nil else { return }
+        if let task = updateTask {
+            if !task.isCancelled { return }
+            updateTask = nil
+        }
 
         updateTask = Task { @MainActor [weak self] in
             guard let self else { return }
@@ -45,7 +49,12 @@ final class WindowCaptureService: ObservableObject {
                 let elapsed = cycleStart.duration(to: clock.now)
                 let remaining = settings.previewRefreshRate.interval - elapsed
                 if remaining > .zero {
-                    try? await Task.sleep(for: remaining)
+                    do {
+                        try await Task.sleep(for: remaining)
+                    } catch {
+                        // Task cancelled — exit promptly instead of swallowing
+                        break
+                    }
                 }
             }
         }
@@ -87,6 +96,8 @@ final class WindowCaptureService: ObservableObject {
     }
 
     func refresh() async {
+        // P1-4: Skip capture while paused and keep the previous frame.
+        guard !settings.isPaused else { return }
         refreshSequence += 1
         let sequence = refreshSequence
 
@@ -106,12 +117,20 @@ final class WindowCaptureService: ObservableObject {
         }
 
         do {
-            let content = try await SCShareableContent.excludingDesktopWindows(
-                true,
-                onScreenWindowsOnly: true
-            )
+            let content = try await withTimeout(.milliseconds(2_000)) {
+                try await SCShareableContent.excludingDesktopWindows(
+                    true,
+                    onScreenWindowsOnly: true
+                )
+            }
 
-            guard sequence == refreshSequence else { return }
+            guard sequence == refreshSequence else {
+                // Stale result discarded — recover visible state if first refresh
+                if !hasCompletedRefresh {
+                    // Do not leave perpetual refreshing; will retry next cycle
+                }
+                return
+            }
 
             let candidates = content.windows
                 .filter { window in
@@ -149,11 +168,34 @@ final class WindowCaptureService: ObservableObject {
                 }
                 .prefix(12)
 
+            // Concurrent capture with per-window timeout (800ms) — P0-3
+            // Use throwing task group; each child may hop off MainActor while awaiting SCScreenshotManager
+            var previewMap: [CGWindowID: NSImage?] = [:]
+            if !candidates.isEmpty {
+                try await withThrowingTaskGroup(of: (CGWindowID, NSImage?).self) { group in
+                    for window in candidates {
+                        group.addTask {
+                            // Each capture isolated; timeout prevents one hung window blocking batch
+                            let image: NSImage? = try? await withTimeout(.milliseconds(800)) {
+                                try await WindowCaptureService.capturePreview(of: window)
+                            }
+                            return (window.windowID, image)
+                        }
+                    }
+                    for try await (wid, img) in group {
+                        // Check cancellation / stale sequence while collecting
+                        if Task.isCancelled { group.cancelAll(); break }
+                        previewMap[wid] = img
+                    }
+                }
+            }
+
+            guard sequence == refreshSequence else { return }
+            if Task.isCancelled { return }
+
             var nextWindows: [CapturedWindow] = []
             var instanceOrdinals: [String: Int] = [:]
             for window in candidates {
-                guard sequence == refreshSequence else { return }
-                let preview = try? await capturePreview(of: window)
                 let owner = window.owningApplication
                 let processIdentifier = owner?.processID ?? 0
                 let title = window.title ?? ""
@@ -175,7 +217,7 @@ final class WindowCaptureService: ObservableObject {
                         title: title,
                         frame: window.frame,
                         instanceOrdinal: ordinal,
-                        preview: preview
+                        preview: previewMap[window.windowID] ?? nil
                     )
                 )
             }
@@ -188,27 +230,48 @@ final class WindowCaptureService: ObservableObject {
             captureState = .ready
             lastRefresh = Date()
             hasCompletedRefresh = true
+        } catch is TimeoutError {
+            // Timeout is recoverable — keep last windows, surface transient failure without clearing hasCompletedRefresh
+            if hasCompletedRefresh {
+                captureState = .ready
+            } else {
+                captureState = .failed("Screen capture timed out")
+            }
         } catch {
             if Task.isCancelled || error is CancellationError {
                 return
             }
+            // If this was first refresh and we failed, leave refreshing -> failed to avoid perpetual spinner
             captureState = .failed(error.localizedDescription)
         }
     }
 
     @discardableResult
-    func select(_ windowID: CGWindowID, activate: Bool = true) -> Bool {
+    func select(_ windowID: CGWindowID, activate: Bool = true) async -> Bool {
         guard let window = windows.first(where: { $0.id == windowID }) else { return false }
         selectedWindowID = windowID
 
         guard activate else { return true }
 
-        let result = AccessibilityService.activate(
-            processIdentifier: window.processIdentifier,
-            windowID: window.id,
-            windowTitle: window.title,
-            windowFrame: window.frame
-        )
+        // P0-1: Run AX activation off MainActor with timeout to avoid blocking UI
+        let result: WindowActivationResult
+        do {
+            result = try await withTimeout(.milliseconds(1_500)) {
+                // detached so AX IPC runs off MainActor
+                await Task.detached(priority: .userInitiated) {
+                    AccessibilityService.activate(
+                        processIdentifier: window.processIdentifier,
+                        windowID: window.id,
+                        windowTitle: window.title,
+                        windowFrame: window.frame
+                    )
+                }.value
+            }
+        } catch is TimeoutError {
+            result = .activationFailed
+        } catch {
+            result = .activationFailed
+        }
 
         switch result {
         case .success:
@@ -228,18 +291,18 @@ final class WindowCaptureService: ObservableObject {
         return false
     }
 
-    func selectRelative(_ offset: Int) {
+    func selectRelative(_ offset: Int) async {
         guard !windows.isEmpty else { return }
         let currentIndex = windows.firstIndex { $0.id == selectedWindowID } ?? 0
         let nextIndex = (currentIndex + offset + windows.count) % windows.count
-        select(windows[nextIndex].id)
+        await select(windows[nextIndex].id)
     }
 
     func window(withID id: CGWindowID) -> CapturedWindow? {
         windows.first { $0.id == id }
     }
 
-    private func capturePreview(of window: SCWindow) async throws -> NSImage {
+    nonisolated private static func capturePreview(of window: SCWindow) async throws -> NSImage {
         let configuration = SCStreamConfiguration()
         let aspectRatio = max(window.frame.width / max(window.frame.height, 1), 0.1)
         configuration.width = 720
@@ -276,11 +339,17 @@ final class WindowCaptureService: ObservableObject {
         Task { @MainActor [weak self] in
             try? await Task.sleep(for: .milliseconds(80))
             guard !Task.isCancelled else { return }
-            self?.updateActiveWindowID()
+            self?.updateActiveWindowID(force: true)
         }
     }
 
-    private func updateActiveWindowID() {
+    private func updateActiveWindowID(force: Bool = false) {
+        // P2-1: Throttle to 200ms to avoid synchronous CGWindowListCopyWindowInfo on every frame.
+        if !force, Date.now.timeIntervalSince(lastActiveUpdate) < 0.2 {
+            return
+        }
+        lastActiveUpdate = Date.now
+
         guard !windows.isEmpty,
               let frontmostProcessID = NSWorkspace.shared.frontmostApplication?.processIdentifier
         else {

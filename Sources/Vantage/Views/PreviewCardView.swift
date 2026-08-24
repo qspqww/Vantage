@@ -40,7 +40,7 @@ struct PreviewCardView: View {
             cardButton
                 .contextMenu {
                     Button(settings.localized("menu.activateWindow")) {
-                        captureService.select(window.id)
+                        Task { await captureService.select(window.id) }
                     }
                     Button(settings.localized("menu.showOverlays")) {
                         settings.showOverlays = true
@@ -172,10 +172,9 @@ struct PreviewCardView: View {
 
     private func selectWindow() {
         let shouldActivate = compact ? settings.activateOnOverlayClick : true
-        let didSelect = captureService.select(window.id, activate: shouldActivate)
-
-        guard compact, shouldActivate, didSelect else { return }
-        DispatchQueue.main.async {
+        Task {
+            let didSelect = await captureService.select(window.id, activate: shouldActivate)
+            guard compact, shouldActivate, didSelect else { return }
             if NSApp.isActive {
                 NSApp.deactivate()
             }

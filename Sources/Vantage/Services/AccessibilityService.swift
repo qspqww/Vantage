@@ -36,7 +36,7 @@ enum AccessibilityService {
         }
     }
 
-    @MainActor
+    /// Synchronous AX activation may block 1-2s (IPC to target process). Callers must run it on a background thread with a timeout wrapper; never call directly on @MainActor.
     @discardableResult
     static func activate(
         processIdentifier: pid_t,

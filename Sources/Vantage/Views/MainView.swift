@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 struct MainView: View {
@@ -7,6 +8,8 @@ struct MainView: View {
 
     @State private var searchText = ""
     @State private var showInspector = false
+    @State private var filterDebounceTask: Task<Void, Never>?
+    @State private var isAppActive = NSApp.isActive
 
     private var filteredWindows: [CapturedWindow] {
         captureService.windows.filter { WindowFilter.matchesSearch($0, query: searchText) }
@@ -61,16 +64,18 @@ struct MainView: View {
             }
         }
         .onChange(of: settings.exactBundleIdentifiers) {
-            Task { await captureService.refresh() }
+            debounceFilterRefresh()
         }
         .onChange(of: settings.exactOwnerNames) {
-            Task { await captureService.refresh() }
+            debounceFilterRefresh()
         }
         .onChange(of: settings.isPaused) {
             if !settings.isPaused {
                 Task { await captureService.refresh() }
             }
         }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didBecomeActiveNotification)) { _ in isAppActive = true }
+        .onReceive(NotificationCenter.default.publisher(for: NSApplication.didResignActiveNotification)) { _ in isAppActive = false }
         .onKeyPress { press in
             guard press.modifiers.contains(.command),
                   let number = Int(press.characters),
@@ -80,7 +85,8 @@ struct MainView: View {
                 return .ignored
             }
 
-            captureService.select(filteredWindows[number - 1].id)
+            let id = filteredWindows[number - 1].id
+            Task { await captureService.select(id) }
             return .handled
         }
         .alert(
@@ -136,7 +142,7 @@ struct MainView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
                 Button {
-                    captureService.selectRelative(1)
+                    Task { await captureService.selectRelative(1) }
                 } label: {
                     Image(systemName: "arrow.right")
                 }
@@ -323,6 +329,13 @@ struct MainView: View {
                     .lineLimit(1)
             }
             Spacer()
+            // P2-2: Overlay hidden while main window is active is intentional; show hint to avoid perceived freeze.
+            if settings.showOverlays && isAppActive {
+                Label(localized("status.overlayHidden"), systemImage: "eye.slash")
+                    .foregroundStyle(VantageTheme.warning)
+                    .lineLimit(1)
+                    .help(localized("status.overlayHidden"))
+            }
             if let activeWindowID = captureService.activeWindowID,
                let activeWindow = captureService.window(withID: activeWindowID) {
                 Label(
@@ -362,6 +375,19 @@ struct MainView: View {
             return VantageTheme.warning
         default:
             return VantageTheme.secondaryText
+        }
+    }
+
+    private func debounceFilterRefresh() {
+        // P1-3: 250ms debounce to avoid per-character full SCK scans; skip while paused.
+        guard !settings.isPaused else { return }
+        filterDebounceTask?.cancel()
+        filterDebounceTask = Task {
+            do {
+                try await Task.sleep(for: .milliseconds(250))
+            } catch { return }
+            guard !Task.isCancelled else { return }
+            await captureService.refresh()
         }
     }
 

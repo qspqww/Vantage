@@ -74,7 +74,8 @@ struct VantageCommands: Commands {
             ForEach(1...9, id: \.self) { number in
                 Button(settings.localized("menu.switchClient", values: ["number": "\(number)"])) {
                     guard captureService.windows.indices.contains(number - 1) else { return }
-                    captureService.select(captureService.windows[number - 1].id)
+                    let id = captureService.windows[number - 1].id
+                    Task { await captureService.select(id) }
                 }
                 .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: [.command])
             }
@@ -82,12 +83,12 @@ struct VantageCommands: Commands {
             Divider()
 
             Button(settings.localized("menu.nextClient")) {
-                captureService.selectRelative(1)
+                Task { await captureService.selectRelative(1) }
             }
             .keyboardShortcut("]", modifiers: [.command, .shift])
 
             Button(settings.localized("menu.previousClient")) {
-                captureService.selectRelative(-1)
+                Task { await captureService.selectRelative(-1) }
             }
             .keyboardShortcut("[", modifiers: [.command, .shift])
 
