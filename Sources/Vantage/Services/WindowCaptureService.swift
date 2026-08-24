@@ -2,6 +2,11 @@ import AppKit
 import CoreGraphics
 @preconcurrency import ScreenCaptureKit
 
+private struct SendablePreview: @unchecked Sendable {
+    let cgImage: CGImage
+    let size: NSSize
+}
+
 @MainActor
 final class WindowCaptureService: ObservableObject {
     @Published private(set) var windows: [CapturedWindow] = []
@@ -169,23 +174,21 @@ final class WindowCaptureService: ObservableObject {
                 .prefix(12)
 
             // Concurrent capture with per-window timeout (800ms) — P0-3
-            // Use throwing task group; each child may hop off MainActor while awaiting SCScreenshotManager
-            var previewMap: [CGWindowID: NSImage?] = [:]
+            // Use CGImage via SendablePreview to satisfy Swift 6 Sendable checks; NSImage is created on MainActor after.
+            var previewMap: [CGWindowID: SendablePreview?] = [:]
             if !candidates.isEmpty {
-                try await withThrowingTaskGroup(of: (CGWindowID, NSImage?).self) { group in
+                try await withThrowingTaskGroup(of: (CGWindowID, SendablePreview?).self) { group in
                     for window in candidates {
                         group.addTask {
-                            // Each capture isolated; timeout prevents one hung window blocking batch
-                            let image: NSImage? = try? await withTimeout(.milliseconds(800)) {
+                            let preview: SendablePreview? = try? await withTimeout(.milliseconds(800)) {
                                 try await WindowCaptureService.capturePreview(of: window)
                             }
-                            return (window.windowID, image)
+                            return (window.windowID, preview)
                         }
                     }
-                    for try await (wid, img) in group {
-                        // Check cancellation / stale sequence while collecting
+                    for try await (wid, preview) in group {
                         if Task.isCancelled { group.cancelAll(); break }
-                        previewMap[wid] = img
+                        previewMap[wid] = preview
                     }
                 }
             }
@@ -208,6 +211,11 @@ final class WindowCaptureService: ObservableObject {
                 let ordinal = instanceOrdinals[identity, default: 0]
                 instanceOrdinals[identity] = ordinal + 1
 
+                let nsPreview: NSImage? = {
+                    guard let p = previewMap[window.windowID] ?? nil else { return nil }
+                    return NSImage(cgImage: p.cgImage, size: p.size)
+                }()
+
                 nextWindows.append(
                     CapturedWindow(
                         id: window.windowID,
@@ -217,7 +225,7 @@ final class WindowCaptureService: ObservableObject {
                         title: title,
                         frame: window.frame,
                         instanceOrdinal: ordinal,
-                        preview: previewMap[window.windowID] ?? nil
+                        preview: nsPreview
                     )
                 )
             }
@@ -254,16 +262,20 @@ final class WindowCaptureService: ObservableObject {
         guard activate else { return true }
 
         // P0-1: Run AX activation off MainActor with timeout to avoid blocking UI
+        // Capture Sendable primitives only to satisfy @Sendable closure.
+        let pid = window.processIdentifier
+        let wid = window.id
+        let title = window.title
+        let frame = window.frame
         let result: WindowActivationResult
         do {
             result = try await withTimeout(.milliseconds(1_500)) {
-                // detached so AX IPC runs off MainActor
                 await Task.detached(priority: .userInitiated) {
                     AccessibilityService.activate(
-                        processIdentifier: window.processIdentifier,
-                        windowID: window.id,
-                        windowTitle: window.title,
-                        windowFrame: window.frame
+                        processIdentifier: pid,
+                        windowID: wid,
+                        windowTitle: title,
+                        windowFrame: frame
                     )
                 }.value
             }
@@ -302,7 +314,7 @@ final class WindowCaptureService: ObservableObject {
         windows.first { $0.id == id }
     }
 
-    nonisolated private static func capturePreview(of window: SCWindow) async throws -> NSImage {
+    nonisolated private static func capturePreview(of window: SCWindow) async throws -> SendablePreview {
         let configuration = SCStreamConfiguration()
         let aspectRatio = max(window.frame.width / max(window.frame.height, 1), 0.1)
         configuration.width = 720
@@ -312,13 +324,13 @@ final class WindowCaptureService: ObservableObject {
         configuration.ignoreShadowsSingleWindow = true
 
         let filter = SCContentFilter(desktopIndependentWindow: window)
-        let image = try await SCScreenshotManager.captureImage(
+        let cgImage = try await SCScreenshotManager.captureImage(
             contentFilter: filter,
             configuration: configuration
         )
 
-        return NSImage(
-            cgImage: image,
+        return SendablePreview(
+            cgImage: cgImage,
             size: NSSize(width: configuration.width, height: configuration.height)
         )
     }
