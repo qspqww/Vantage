@@ -44,6 +44,7 @@
   "status.accessibilityEnabled": "Accessibility Enabled",
   "status.accessibilityDisabled": "Accessibility Disabled",
   "status.overlayHidden": "Floating previews hidden while app is active",
+  "status.listStale": "Binding new windows…",
   "activation.permissionRequired": "Vantage needs Accessibility permission to switch between windows in the same application.",
   "activation.processUnavailable": "The target client process has exited. Refresh the window list and try again.",
   "activation.targetWindowNotFound": "The matching window was not found. It may have closed, moved to another Space, or changed its title.",

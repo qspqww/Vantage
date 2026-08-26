@@ -44,6 +44,7 @@
   "status.accessibilityEnabled": "辅助功能已开启",
   "status.accessibilityDisabled": "辅助功能未开启",
   "status.overlayHidden": "应用激活时浮窗自动隐藏",
+  "status.listStale": "正在绑定新窗口…",
   "activation.permissionRequired": "需要在系统设置中授予 Vantage 辅助功能权限，才能精确切换同一应用中的不同窗口。",
   "activation.processUnavailable": "目标客户端进程已经退出，请刷新窗口列表后重试。",
   "activation.targetWindowNotFound": "未能在目标进程中找到对应窗口。窗口可能已经关闭、移动到其他空间或更改了标题。",

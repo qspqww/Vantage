@@ -336,6 +336,12 @@ struct MainView: View {
                     .lineLimit(1)
                     .help(localized("status.overlayHidden"))
             }
+            // P0 truth-telling: fresh windows discovered but pixels not bound yet.
+            if captureService.listStale {
+                Label(localized("status.listStale"), systemImage: "arrow.triangle.2.circlepath")
+                    .foregroundStyle(VantageTheme.warning)
+                    .lineLimit(1)
+            }
             if let activeWindowID = captureService.activeWindowID,
                let activeWindow = captureService.window(withID: activeWindowID) {
                 Label(

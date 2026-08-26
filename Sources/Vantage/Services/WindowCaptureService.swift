@@ -1,10 +1,32 @@
 import AppKit
 import CoreGraphics
+import os.log
 @preconcurrency import ScreenCaptureKit
 
-private struct SendablePreview: @unchecked Sendable {
+private let discoveryLog = Logger(subsystem: "dev.vantage.preview", category: "discovery")
+
+/// Mirror of one on-screen window parsed from CGWindowListCopyWindowInfo.
+/// Value-type and Sendable so it can cross actor boundaries safely.
+struct DiscoveredWindow: Sendable {
+    let windowID: CGWindowID
+    let processIdentifier: pid_t
+    let ownerName: String
+    let bundleIdentifier: String?
+    let title: String
+    let layer: Int
+    let frame: CGRect
+}
+
+struct SendablePreview: @unchecked Sendable {
     let cgImage: CGImage
     let size: NSSize
+}
+
+/// Box for handing an SCScreenshotManager-required SCWindow into a detached child
+/// task without tripping Swift 6.3 sending-closure analysis (@unchecked mirrors
+/// ScreenCaptureKit's own undeclared isolation, same as our @preconcurrency import).
+private struct HandleBox: @unchecked Sendable {
+    let scWindow: SCWindow?
 }
 
 @MainActor
@@ -15,12 +37,30 @@ final class WindowCaptureService: ObservableObject {
     @Published private(set) var hasCompletedRefresh = false
     @Published private(set) var captureState: CaptureState = .idle
     @Published private(set) var lastRefresh: Date?
+    /// True when a freshly-discovered window cannot be pixel-bound yet because
+    /// SCK handle binding is timing out and backing off. Honest staleness signal.
+    @Published private(set) var listStale = false
     @Published var activationError: WindowActivationError?
 
     private let settings: SettingsStore
     private var updateTask: Task<Void, Never>?
     private var refreshSequence = 0
     private var lastActiveUpdate = Date.distantPast
+
+    // P1: Discovery uses cheap synchronous CGWindowList every cycle (no XPC,
+    // no timeout class). SCShareableContent runs ONLY to bind the SCWindow handles
+    // SCScreenshotManager requires, triggered when an unknown windowID appears,
+    // with adaptive timeout/backoff. This removes hot-loop enumeration that caused
+    // long-run stalls and stale-list "fake update" states.
+    @preconcurrency private var scWindowsByID: [CGWindowID: SCWindow] = [:]
+    private var lastHandleBindAttempt = Date.distantPast
+    private var handleBindBackoffUntil = Date.distantPast
+    private var consecutiveBindTimeouts = 0
+    private var bindTimeoutMs = 2_000
+
+    // Diagnostics throttle.
+    private var lastDiscoveryLog = Date.distantPast
+    private var lastCandidateCount = -1
 
     init(settings: SettingsStore) {
         self.settings = settings
@@ -53,13 +93,13 @@ final class WindowCaptureService: ObservableObject {
 
                 let elapsed = cycleStart.duration(to: clock.now)
                 let remaining = settings.previewRefreshRate.interval - elapsed
-                if remaining > .zero {
-                    do {
-                        try await Task.sleep(for: remaining)
-                    } catch {
-                        // Task cancelled — exit promptly instead of swallowing
-                        break
-                    }
+                // Always sleep at least 50ms: when a cycle overruns its interval,
+                // sleeping zero would busy-spin the MainActor and hammer WindowServer.
+                do {
+                    try await Task.sleep(for: max(remaining, .milliseconds(50)))
+                } catch {
+                    // Task cancelled — exit promptly instead of swallowing
+                    break
                 }
             }
         }
@@ -100,6 +140,97 @@ final class WindowCaptureService: ObservableObject {
         }
     }
 
+    // MARK: - Discovery (P1)
+
+    nonisolated private static func doubleValue(_ any: Any?) -> Double? {
+        switch any {
+        case let n as NSNumber: return n.doubleValue
+        case let d as Double: return d
+        case let i as Int: return Double(i)
+        default: return nil
+        }
+    }
+
+    /// Parses one raw CGWindowList entry. Static pure function so tests can feed fixtures.
+    nonisolated static func parseDiscovered(
+        _ info: [String: Any],
+        bundleResolver: (pid_t) -> String?
+    ) -> DiscoveredWindow? {
+        guard let number = (info[kCGWindowNumber as String] as? NSNumber)?.uint32Value else { return nil }
+        guard let pid = (info[kCGWindowOwnerPID as String] as? NSNumber)?.int32Value else { return nil }
+
+        guard let bounds = info[kCGWindowBounds as String] as? [String: Any],
+              let x = doubleValue(bounds["X"]),
+              let y = doubleValue(bounds["Y"]),
+              let width = doubleValue(bounds["Width"]),
+              let height = doubleValue(bounds["Height"]) else {
+            return nil
+        }
+
+        return DiscoveredWindow(
+            windowID: CGWindowID(number),
+            processIdentifier: pid,
+            ownerName: info[kCGWindowOwnerName as String] as? String ?? "",
+            bundleIdentifier: bundleResolver(pid),
+            title: info[kCGWindowName as String] as? String ?? "",
+            layer: (info[kCGWindowLayer as String] as? NSNumber)?.intValue ?? 0,
+            frame: CGRect(x: x, y: y, width: width, height: height)
+        )
+    }
+
+    /// Full discovery pipeline: parse, eligibility filter, deterministic sort, cap at 12.
+    nonisolated static func discoverWindows(
+        raw: [[String: Any]],
+        bundleResolver: @escaping (pid_t) -> String?,
+        ownerAllowlist: [String],
+        bundleAllowlist: [String]
+    ) -> [DiscoveredWindow] {
+        Array(
+            raw.compactMap { parseDiscovered($0, bundleResolver: bundleResolver) }
+                .filter { d in
+                    guard d.processIdentifier > 0 else { return false }
+                    guard WindowFilter.isNormalWindow(
+                        isOnScreen: true,
+                        windowLayer: d.layer,
+                        title: d.title.isEmpty ? nil : d.title,
+                        frame: d.frame
+                    ) else {
+                        return false
+                    }
+                    return WindowFilter.isEligible(
+                        ownerName: d.ownerName,
+                        bundleIdentifier: d.bundleIdentifier,
+                        exactBundleIdentifiers: bundleAllowlist,
+                        exactOwnerNames: ownerAllowlist
+                    )
+                }
+                .sorted { lhs, rhs in
+                    if lhs.ownerName == rhs.ownerName {
+                        if lhs.title == rhs.title {
+                            if lhs.frame.origin.y == rhs.frame.origin.y {
+                                return lhs.frame.origin.x < rhs.frame.origin.x
+                            }
+                            return lhs.frame.origin.y < rhs.frame.origin.y
+                        }
+                        return lhs.title < rhs.title
+                    }
+                    return lhs.ownerName < rhs.ownerName
+                }
+                .prefix(12)
+        )
+    }
+
+    private func logDiscoverySummary(totalOnScreen: Int, discovered: [DiscoveredWindow]) {
+        let now = Date.now
+        let countChanged = discovered.count != lastCandidateCount
+        guard countChanged || now.timeIntervalSince(lastDiscoveryLog) >= 5.0 else { return }
+        lastCandidateCount = discovered.count
+        lastDiscoveryLog = now
+        discoveryLog.info("discovered=\(discovered.count, privacy: .public) totalOnScreen=\(totalOnScreen, privacy: .public)")
+    }
+
+    // MARK: - Refresh cycle
+
     func refresh() async {
         // P1-4: Skip capture while paused and keep the previous frame.
         guard !settings.isPaused else { return }
@@ -121,137 +252,141 @@ final class WindowCaptureService: ObservableObject {
             captureState = .refreshing
         }
 
+        // ---- Cheap synchronous discovery every cycle (P1). Microseconds; no XPC,
+        // no timeout class. New windows are visible within one refresh period.
+        let rawInfo = (CGWindowListCopyWindowInfo([.optionOnScreenOnly, .excludeDesktopElements], kCGNullWindowID) as? [[String: Any]]) ?? []
+        let discovered = Self.discoverWindows(
+            raw: rawInfo,
+            bundleResolver: { pid in NSRunningApplication(processIdentifier: pid)?.bundleIdentifier },
+            ownerAllowlist: settings.exactOwnerNameList,
+            bundleAllowlist: settings.exactBundleIdentifierList
+        )
+        logDiscoverySummary(totalOnScreen: rawInfo.count, discovered: discovered)
+
+        // ---- Bind SCK handles only when an unknown windowID appeared (rare event).
+        let unknownIDs = discovered.filter { scWindowsByID[$0.windowID] == nil }.map(\.windowID)
+        var bindFailed = false
+        if !unknownIDs.isEmpty, Date.now >= handleBindBackoffUntil,
+           Date.now.timeIntervalSince(lastHandleBindAttempt) >= 0.5 {
+            lastHandleBindAttempt = Date.now
+            do {
+                let content = try await withTimeout(.milliseconds(bindTimeoutMs)) {
+                    try await SCShareableContent.excludingDesktopWindows(
+                        true,
+                        onScreenWindowsOnly: true
+                    )
+                }
+                guard sequence == refreshSequence else { return }
+                scWindowsByID = Dictionary(content.windows.map { ($0.windowID, $0) },
+                                           uniquingKeysWith: { _, new in new })
+                consecutiveBindTimeouts = 0
+                bindTimeoutMs = 2_000
+                discoveryLog.info("handle bind ok windows=\(content.windows.count, privacy: .public)")
+            } catch is TimeoutError {
+                bindFailed = true
+                consecutiveBindTimeouts += 1
+                bindTimeoutMs = min(bindTimeoutMs * 2, 8_000)
+                let backoffSeconds = min(Double(consecutiveBindTimeouts) * 2.0, 15.0)
+                handleBindBackoffUntil = Date.now.addingTimeInterval(backoffSeconds)
+                discoveryLog.error("handle bind TIMEOUT #\(self.consecutiveBindTimeouts, privacy: .public) backoff=\(Int(backoffSeconds), privacy: .public)s pendingIDs=\(unknownIDs.count, privacy: .public)")
+            } catch {
+                bindFailed = true
+                discoveryLog.error("handle bind error \(error.localizedDescription, privacy: .public)")
+            }
+        }
+
+        // P0 truth-telling: staleness only when freshly discovered IDs still lack
+        // pixel-bound handles because binding is backing off.
+        listStale = bindFailed && !unknownIDs.isEmpty
+
+        // ---- Snapshot MainActor state before entering concurrent captures.
+        // Unbound IDs skip capture fast instead of burning per-window timeouts.
+        let captureJobs: [(window: DiscoveredWindow, handle: HandleBox)] = discovered.map {
+            ($0, HandleBox(scWindow: scWindowsByID[$0.windowID]))
+        }
+
+        // ---- Concurrent per-window preview capture (800ms each).
+        var previewMap: [CGWindowID: SendablePreview?] = [:]
         do {
-            let content = try await withTimeout(.milliseconds(2_000)) {
-                try await SCShareableContent.excludingDesktopWindows(
-                    true,
-                    onScreenWindowsOnly: true
-                )
-            }
-
-            guard sequence == refreshSequence else {
-                // Stale result discarded — recover visible state if first refresh
-                if !hasCompletedRefresh {
-                    // Do not leave perpetual refreshing; will retry next cycle
-                }
-                return
-            }
-
-            let candidates = content.windows
-                .filter { window in
-                    guard WindowFilter.isNormalWindow(
-                        isOnScreen: window.isOnScreen,
-                        windowLayer: window.windowLayer,
-                        title: window.title,
-                        frame: window.frame
-                    ) else {
-                        return false
-                    }
-
-                    let ownerName = window.owningApplication?.applicationName ?? ""
-                    guard window.owningApplication?.processID ?? 0 > 0 else { return false }
-                    return WindowFilter.isEligible(
-                        ownerName: ownerName,
-                        bundleIdentifier: window.owningApplication?.bundleIdentifier,
-                        exactBundleIdentifiers: settings.exactBundleIdentifierList,
-                        exactOwnerNames: settings.exactOwnerNameList
-                    )
-                }
-                .sorted { lhs, rhs in
-                    let lhsOwner = lhs.owningApplication?.applicationName ?? ""
-                    let rhsOwner = rhs.owningApplication?.applicationName ?? ""
-                    if lhsOwner == rhsOwner {
-                        if (lhs.title ?? "") == (rhs.title ?? "") {
-                            if lhs.frame.origin.y == rhs.frame.origin.y {
-                                return lhs.frame.origin.x < rhs.frame.origin.x
-                            }
-                            return lhs.frame.origin.y < rhs.frame.origin.y
+            try await withThrowingTaskGroup(of: (CGWindowID, SendablePreview?).self) { group in
+                for job in captureJobs {
+                    let window = job.window
+                    let box = job.handle
+                    group.addTask {
+                        guard let handle = box.scWindow else {
+                            // No SCK handle yet — skip fast, preview stays nil this cycle.
+                            return (window.windowID, nil)
                         }
-                        return (lhs.title ?? "") < (rhs.title ?? "")
-                    }
-                    return lhsOwner < rhsOwner
-                }
-                .prefix(12)
-
-            // Concurrent capture with per-window timeout (800ms) — P0-3
-            // Use CGImage via SendablePreview to satisfy Swift 6 Sendable checks; NSImage is created on MainActor after.
-            var previewMap: [CGWindowID: SendablePreview?] = [:]
-            if !candidates.isEmpty {
-                try await withThrowingTaskGroup(of: (CGWindowID, SendablePreview?).self) { group in
-                    for window in candidates {
-                        group.addTask {
-                            let preview: SendablePreview? = try? await withTimeout(.milliseconds(800)) {
-                                try await WindowCaptureService.capturePreview(of: window)
-                            }
-                            return (window.windowID, preview)
+                        let preview: SendablePreview? = try? await withTimeout(.milliseconds(800)) {
+                            try await WindowCaptureService.capturePreview(of: window, scWindow: handle)
                         }
-                    }
-                    for try await (wid, preview) in group {
-                        if Task.isCancelled { group.cancelAll(); break }
-                        previewMap[wid] = preview
+                        return (window.windowID, preview)
                     }
                 }
+                for try await (wid, preview) in group {
+                    if Task.isCancelled { group.cancelAll(); break }
+                    previewMap[wid] = preview
+                }
             }
-
-            guard sequence == refreshSequence else { return }
-            if Task.isCancelled { return }
-
-            var nextWindows: [CapturedWindow] = []
-            var instanceOrdinals: [String: Int] = [:]
-            for window in candidates {
-                let owner = window.owningApplication
-                let processIdentifier = owner?.processID ?? 0
-                let title = window.title ?? ""
-                let identity = [
-                    String(processIdentifier),
-                    title,
-                    String(Int(window.frame.width.rounded())),
-                    String(Int(window.frame.height.rounded()))
-                ].joined(separator: "\u{0}")
-                let ordinal = instanceOrdinals[identity, default: 0]
-                instanceOrdinals[identity] = ordinal + 1
-
-                let nsPreview: NSImage? = {
-                    guard let p = previewMap[window.windowID] ?? nil else { return nil }
-                    return NSImage(cgImage: p.cgImage, size: p.size)
-                }()
-
-                nextWindows.append(
-                    CapturedWindow(
-                        id: window.windowID,
-                        processIdentifier: processIdentifier,
-                        ownerName: owner?.applicationName ?? "Unknown",
-                        bundleIdentifier: owner?.bundleIdentifier,
-                        title: title,
-                        frame: window.frame,
-                        instanceOrdinal: ordinal,
-                        preview: nsPreview
-                    )
-                )
-            }
-
-            guard sequence == refreshSequence else { return }
-
-            windows = nextWindows
-            normalizeSelection()
-            updateActiveWindowID()
-            captureState = .ready
-            lastRefresh = Date()
-            hasCompletedRefresh = true
         } catch is TimeoutError {
-            // Timeout is recoverable — keep last windows, surface transient failure without clearing hasCompletedRefresh
-            if hasCompletedRefresh {
-                captureState = .ready
-            } else {
-                captureState = .failed("Screen capture timed out")
+            // Capture-phase timeout cannot happen per-window (children swallow);
+            // a group-level timeout only surfaces from infrastructure — treat as failure.
+            if !hasCompletedRefresh {
+                captureState = .failed("Preview capture timed out")
             }
+            return
         } catch {
             if Task.isCancelled || error is CancellationError {
                 return
             }
-            // If this was first refresh and we failed, leave refreshing -> failed to avoid perpetual spinner
-            captureState = .failed(error.localizedDescription)
+            if !hasCompletedRefresh {
+                captureState = .failed(error.localizedDescription)
+            }
+            return
         }
+
+        guard sequence == refreshSequence else { return }
+        if Task.isCancelled { return }
+
+        // ---- Publish. List is always derived from this cycle's live enumeration,
+        // so timestamps can never outrun the underlying truth (kills fake-update A).
+        var nextWindows: [CapturedWindow] = []
+        var instanceOrdinals: [String: Int] = [:]
+        for window in discovered {
+            let identity = [
+                String(window.processIdentifier),
+                window.title,
+                String(Int(window.frame.width.rounded())),
+                String(Int(window.frame.height.rounded()))
+            ].joined(separator: "\u{0}")
+            let ordinal = instanceOrdinals[identity, default: 0]
+            instanceOrdinals[identity] = ordinal + 1
+
+            let nsPreview: NSImage? = {
+                guard let p = previewMap[window.windowID] ?? nil else { return nil }
+                return NSImage(cgImage: p.cgImage, size: p.size)
+            }()
+
+            nextWindows.append(
+                CapturedWindow(
+                    id: window.windowID,
+                    processIdentifier: window.processIdentifier,
+                    ownerName: window.ownerName.isEmpty ? "Unknown" : window.ownerName,
+                    bundleIdentifier: window.bundleIdentifier,
+                    title: window.title,
+                    frame: window.frame,
+                    instanceOrdinal: ordinal,
+                    preview: nsPreview
+                )
+            )
+        }
+
+        windows = nextWindows
+        normalizeSelection()
+        updateActiveWindowID()
+        captureState = .ready
+        lastRefresh = Date()
+        hasCompletedRefresh = true
     }
 
     @discardableResult
@@ -314,7 +449,7 @@ final class WindowCaptureService: ObservableObject {
         windows.first { $0.id == id }
     }
 
-    nonisolated private static func capturePreview(of window: SCWindow) async throws -> SendablePreview {
+    nonisolated private static func capturePreview(of window: DiscoveredWindow, scWindow: SCWindow) async throws -> SendablePreview {
         let configuration = SCStreamConfiguration()
         let aspectRatio = max(window.frame.width / max(window.frame.height, 1), 0.1)
         configuration.width = 720
@@ -323,7 +458,7 @@ final class WindowCaptureService: ObservableObject {
         configuration.scalesToFit = true
         configuration.ignoreShadowsSingleWindow = true
 
-        let filter = SCContentFilter(desktopIndependentWindow: window)
+        let filter = SCContentFilter(desktopIndependentWindow: scWindow)
         let cgImage = try await SCScreenshotManager.captureImage(
             contentFilter: filter,
             configuration: configuration
@@ -356,7 +491,7 @@ final class WindowCaptureService: ObservableObject {
     }
 
     private func updateActiveWindowID(force: Bool = false) {
-        // P2-1: Throttle to 200ms to avoid synchronous CGWindowListCopyWindowInfo on every frame.
+        // Throttle to 200ms to avoid synchronous CGWindowListCopyWindowInfo on every frame.
         if !force, Date.now.timeIntervalSince(lastActiveUpdate) < 0.2 {
             return
         }
@@ -392,5 +527,4 @@ final class WindowCaptureService: ObservableObject {
 
         activeWindowID = nil
     }
-
 }
