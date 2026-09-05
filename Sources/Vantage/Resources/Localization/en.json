@@ -75,6 +75,7 @@
   "settings.granted": "Granted",
   "settings.notGranted": "Not Granted",
   "settings.language": "Language",
+  "settings.hotkeysHelp": "Global hotkeys work even when a client has focus: ⌘1-9 switch clients, ⌘⇧] / ⌘⇧[ next / previous.",
   "inspector.floatingPreview": "Floating Preview",
   "inspector.activateOnClick": "Switch Window on Click",
   "inspector.alwaysOnTop": "Always on Top",

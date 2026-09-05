@@ -75,6 +75,7 @@
   "settings.granted": "已授权",
   "settings.notGranted": "未授权",
   "settings.language": "语言",
+  "settings.hotkeysHelp": "全局热键在客户端获得焦点时同样生效：⌘1-9 切换客户端，⌘⇧] / ⌘⇧[ 下一个 / 上一个。",
   "inspector.floatingPreview": "浮动预览",
   "inspector.activateOnClick": "点击时切换窗口",
   "inspector.alwaysOnTop": "始终置顶",

@@ -33,6 +33,9 @@ struct PreferencesView: View {
                         Text(language.displayName(in: settings.language)).tag(language)
                     }
                 }
+                Text(settings.localized("settings.hotkeysHelp"))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             } header: {
                 Text(settings.localized("settings.language"))
             }

@@ -57,6 +57,10 @@ final class WindowCaptureService: ObservableObject {
     private var handleBindBackoffUntil = Date.distantPast
     private var consecutiveBindTimeouts = 0
     private var bindTimeoutMs = 2_000
+    // Fix 3: per-ID capture failure streak; >=3 consecutive failures drop the
+    // handle so the next cycle rebinds via the normal unknown-ID path (covers
+    // windowID reuse by a recreated window).
+    private var consecutiveCaptureFailures: [CGWindowID: Int] = [:]
 
     // Diagnostics throttle.
     private var lastDiscoveryLog = Date.distantPast
@@ -263,6 +267,16 @@ final class WindowCaptureService: ObservableObject {
         )
         logDiscoverySummary(totalOnScreen: rawInfo.count, discovered: discovered)
 
+        // Fix 1: prune handle table (and failure streaks) to the live set so a
+        // long-running session cannot accumulate stale SCWindow strong references.
+        let discoveredIDs = Set(discovered.map(\.windowID))
+        if scWindowsByID.count > discoveredIDs.count {
+            scWindowsByID = scWindowsByID.filter { discoveredIDs.contains($0.key) }
+        }
+        if consecutiveCaptureFailures.count > discoveredIDs.count {
+            consecutiveCaptureFailures = consecutiveCaptureFailures.filter { discoveredIDs.contains($0.key) }
+        }
+
         // ---- Bind SCK handles only when an unknown windowID appeared (rare event).
         let unknownIDs = discovered.filter { scWindowsByID[$0.windowID] == nil }.map(\.windowID)
         var bindFailed = false
@@ -295,9 +309,10 @@ final class WindowCaptureService: ObservableObject {
             }
         }
 
-        // P0 truth-telling: staleness only when freshly discovered IDs still lack
-        // pixel-bound handles because binding is backing off.
-        listStale = bindFailed && !unknownIDs.isEmpty
+        // P0 truth-telling: staleness whenever freshly discovered IDs still lack
+        // pixel-bound handles — both immediately after a failed bind attempt and
+        // throughout the backoff gap (fix 2), so the status hint never blinks off.
+        listStale = !unknownIDs.isEmpty && (bindFailed || Date.now < handleBindBackoffUntil)
 
         // ---- Snapshot MainActor state before entering concurrent captures.
         // Unbound IDs skip capture fast instead of burning per-window timeouts.
@@ -347,6 +362,25 @@ final class WindowCaptureService: ObservableObject {
 
         guard sequence == refreshSequence else { return }
         if Task.isCancelled { return }
+
+        // Fix 3: same-ID reuse rebind. A bound handle whose capture keeps failing
+        // (window closed and windowID recycled) is dropped after 3 consecutive
+        // failures, making the ID "unknown" again so the normal bind path refreshes it.
+        let hadHandleIDs = Set(captureJobs.compactMap { $0.handle.scWindow != nil ? $0.window.windowID : nil })
+        for (wid, preview) in previewMap {
+            guard hadHandleIDs.contains(wid) else { continue }
+            if preview != nil {
+                consecutiveCaptureFailures[wid] = nil
+            } else {
+                let streak = (consecutiveCaptureFailures[wid] ?? 0) + 1
+                consecutiveCaptureFailures[wid] = streak
+                if streak >= 3 {
+                    scWindowsByID[wid] = nil
+                    consecutiveCaptureFailures[wid] = nil
+                    discoveryLog.error("capture failed \(streak, privacy: .public)x for id=\(wid, privacy: .public); dropped handle to force rebind")
+                }
+            }
+        }
 
         // ---- Publish. List is always derived from this cycle's live enumeration,
         // so timestamps can never outrun the underlying truth (kills fake-update A).
@@ -404,15 +438,17 @@ final class WindowCaptureService: ObservableObject {
         let frame = window.frame
         let result: WindowActivationResult
         do {
+            // withTimeout already runs the operation detached off MainActor.
+            // Its abandon-on-deadline semantics guarantee this returns within
+            // ~1.5s even when the target process is dying (plus AX messaging
+            // timeout set inside AccessibilityService as second belt).
             result = try await withTimeout(.milliseconds(1_500)) {
-                await Task.detached(priority: .userInitiated) {
-                    AccessibilityService.activate(
-                        processIdentifier: pid,
-                        windowID: wid,
-                        windowTitle: title,
-                        windowFrame: frame
-                    )
-                }.value
+                AccessibilityService.activate(
+                    processIdentifier: pid,
+                    windowID: wid,
+                    windowTitle: title,
+                    windowFrame: frame
+                )
             }
         } catch is TimeoutError {
             result = .activationFailed

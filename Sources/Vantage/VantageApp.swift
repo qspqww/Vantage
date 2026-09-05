@@ -7,6 +7,7 @@ struct VantageApp: App {
     @StateObject private var settings: SettingsStore
     @StateObject private var captureService: WindowCaptureService
     @StateObject private var overlayController: OverlayWindowController
+    @StateObject private var hotKeyService = GlobalHotKeyServiceHolder()
 
     init() {
         let settings = SettingsStore()
@@ -32,6 +33,10 @@ struct VantageApp: App {
                 .task {
                     captureService.start()
                     overlayController.start()
+                    hotKeyService.start(captureService: captureService)
+                }
+                .onDisappear {
+                    hotKeyService.stop()
                 }
         }
         .defaultSize(width: 1180, height: 760)
@@ -61,6 +66,37 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationShouldTerminateAfterLastWindowClosed(_ sender: NSApplication) -> Bool {
         false
+    }
+}
+
+/// StateObject-friendly wrapper so GlobalHotKeyService survives SwiftUI view
+/// lifetime and its callback reaches the capture service on MainActor.
+@MainActor
+final class GlobalHotKeyServiceHolder: ObservableObject {
+    private let service = GlobalHotKeyService()
+    private weak var captureService: WindowCaptureService?
+
+    func start(captureService: WindowCaptureService) {
+        self.captureService = captureService
+        service.start { [weak self] action in
+            guard let self, let capture = self.captureService else { return }
+            Task { @MainActor in
+                switch action {
+                case .selectIndex(let index):
+                    guard capture.windows.indices.contains(index) else { return }
+                    await capture.select(capture.windows[index].id)
+                case .nextClient:
+                    await capture.selectRelative(1)
+                case .previousClient:
+                    await capture.selectRelative(-1)
+                }
+            }
+        }
+    }
+
+    func stop() {
+        service.stop()
+        captureService = nil
     }
 }
 

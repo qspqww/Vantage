@@ -63,6 +63,11 @@ enum AccessibilityService {
 
         let application = AXUIElementCreateApplication(processIdentifier)
 
+        // Server-side bound: every AX call on this element (and elements derived
+        // from it) fails after 1.5s instead of hanging when the client is dying
+        // or its event loop is stuck (common with Wine while a client exits).
+        AXUIElementSetMessagingTimeout(application, 1.5)
+
         // Some applications only expose a complete AX window list after they
         // become frontmost. This is a best-effort hint; AXRaise below remains
         // the operation that actually selects the target window.
