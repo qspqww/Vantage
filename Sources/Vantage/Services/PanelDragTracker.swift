@@ -12,16 +12,27 @@ import Foundation
 /// coordinates, so a fixed grab offset in window space would double-count the
 /// movement.
 struct PanelDragTracker {
+    /// Displacement (points) from mouse-down beyond which a gesture counts as a
+    /// drag, not a click. OverlayPanel uses this to swallow the mouse-up so the
+    /// hosted SwiftUI button never sees a click at the end of a panel move.
+    static let clickThreshold: Double = 5
+
     private(set) var isDragging = false
+    /// True once the cursor has moved at least `clickThreshold` from mouse-down.
+    private(set) var movedBeyondClickThreshold = false
+    private var downCursorScreen = NSPoint.zero
     private var lastCursorScreen = NSPoint.zero
 
     /// Records the screen-space cursor position at mouse-down.
     mutating func begin(mouseLocationInWindow: NSPoint, windowOrigin: NSPoint) {
-        lastCursorScreen = NSPoint(
+        let cursor = NSPoint(
             x: windowOrigin.x + mouseLocationInWindow.x,
             y: windowOrigin.y + mouseLocationInWindow.y
         )
+        downCursorScreen = cursor
+        lastCursorScreen = cursor
         isDragging = true
+        movedBeyondClickThreshold = false
     }
 
     /// Applies the screen-space cursor delta to the window origin.
@@ -35,6 +46,11 @@ struct PanelDragTracker {
             x: currentOrigin.x + mouseLocationInWindow.x,
             y: currentOrigin.y + mouseLocationInWindow.y
         )
+        if !movedBeyondClickThreshold,
+           hypot(cursorScreen.x - downCursorScreen.x, cursorScreen.y - downCursorScreen.y)
+            >= Self.clickThreshold {
+            movedBeyondClickThreshold = true
+        }
         let deltaX = cursorScreen.x - lastCursorScreen.x
         let deltaY = cursorScreen.y - lastCursorScreen.y
         lastCursorScreen = cursorScreen

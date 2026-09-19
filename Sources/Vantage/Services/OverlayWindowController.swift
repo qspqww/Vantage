@@ -7,6 +7,12 @@ final class OverlayWindowController: NSObject, ObservableObject {
     private let captureService: WindowCaptureService
     private let settings: SettingsStore
     private var panels: [CGWindowID: OverlayPanel] = [:]
+    // Panels whose window vanished stay in limbo (hidden) for a grace window
+    // instead of being closed immediately: fullscreen toggles, minimize, and
+    // transient empty titles all recreate the window within seconds, and
+    // rebinding the same panel preserves its position and drag/hover state.
+    private var missingPanels: [CGWindowID: (panel: OverlayPanel, since: Date)] = [:]
+    private let missingPanelGrace: TimeInterval = 4.0
     private var cancellables: Set<AnyCancellable> = []
     private var isApplyingLayout = false
     private var isApplyingMenuSetting = false
@@ -162,10 +168,20 @@ final class OverlayWindowController: NSObject, ObservableObject {
 
     private func syncPanels(with windows: [CapturedWindow]) {
         let validIDs = Set(windows.map(\.id))
+        let now = Date.now
 
-        for (id, panel) in panels where !validIDs.contains(id) {
-            panel.close()
+        for id in Array(panels.keys) where !validIDs.contains(id) {
+            guard let panel = panels[id] else { continue }
+            panel.orderOut(nil)
+            missingPanels[id] = (panel, now)
             panels[id] = nil
+        }
+
+        for id in Array(missingPanels.keys) {
+            guard let entry = missingPanels[id],
+                  now.timeIntervalSince(entry.since) >= missingPanelGrace else { continue }
+            entry.panel.close()
+            missingPanels[id] = nil
         }
 
         var newPanels: [OverlayPanel] = []
@@ -200,6 +216,9 @@ final class OverlayWindowController: NSObject, ObservableObject {
                 } else {
                     panel.positionKey = newKey
                 }
+            } else if let rebound = takeMissingPanel(for: window) {
+                rebind(rebound, to: window)
+                panels[window.id] = rebound
             } else {
                 let panel = makePanel(for: window)
                 panels[window.id] = panel
@@ -210,6 +229,43 @@ final class OverlayWindowController: NSObject, ObservableObject {
         applyVisibility()
         if !newPanels.isEmpty {
             restoreOrPlace(newPanels)
+        }
+    }
+
+    /// Finds a limbo panel to revive for a rediscovered window. Exact position-key
+    /// match first (window recreated with the same identity, e.g. fullscreen
+    /// toggle); otherwise a single unambiguous candidate from the same process,
+    /// which covers a title change that happened while the window was gone.
+    private func takeMissingPanel(for window: CapturedWindow) -> OverlayPanel? {
+        let key = window.overlayPositionKey
+        if let exact = missingPanels.first(where: { $0.value.panel.positionKey == key }) {
+            missingPanels[exact.key] = nil
+            return exact.value.panel
+        }
+
+        let identity = window.bundleIdentifier ?? window.ownerName
+        let sameOwner = missingPanels.filter {
+            $0.value.panel.ownerProcessIdentifier == window.processIdentifier
+                && $0.value.panel.ownerIdentity == identity
+        }
+        guard sameOwner.count == 1, let only = sameOwner.first else { return nil }
+        missingPanels[only.key] = nil
+        return only.value.panel
+    }
+
+    /// Revives a limbo panel for a new windowID without touching its frame:
+    /// the panel reappears exactly where it was instead of flying in from a
+    /// default slot. Content and menu are rebuilt because both bind the ID.
+    private func rebind(_ panel: OverlayPanel, to window: CapturedWindow) {
+        panel.windowIDValue = window.id
+        panel.positionKey = window.overlayPositionKey
+        panel.ownerProcessIdentifier = window.processIdentifier
+        panel.ownerIdentity = window.bundleIdentifier ?? window.ownerName
+        attachContent(to: panel, for: window)
+        // First occurrence of the new identity: adopt the kept position so it
+        // survives the next launch instead of being resurrected from nothing.
+        if settings.savedOverlayOrigin(for: panel.positionKey) == nil {
+            savePosition(of: panel, origin: panel.frame.origin)
         }
     }
 
@@ -224,6 +280,8 @@ final class OverlayWindowController: NSObject, ObservableObject {
 
         panel.windowIDValue = window.id
         panel.positionKey = window.overlayPositionKey
+        panel.ownerProcessIdentifier = window.processIdentifier
+        panel.ownerIdentity = window.bundleIdentifier ?? window.ownerName
         panel.delegate = self
         panel.backgroundColor = .clear
         panel.isOpaque = false
@@ -234,6 +292,13 @@ final class OverlayWindowController: NSObject, ObservableObject {
         // OverlayPanel moves itself via PanelDragTracker in sendEvent(_:).
         panel.isMovableByWindowBackground = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
+        panel.level = settings.alwaysOnTop ? .floating : .normal
+        panel.alphaValue = settings.overlayOpacity
+        attachContent(to: panel, for: window)
+        return panel
+    }
+
+    private func attachContent(to panel: OverlayPanel, for window: CapturedWindow) {
         let hostingView = OverlayHostingView(
             rootView: OverlayThumbnailView(windowID: window.id)
                 .environmentObject(captureService)
@@ -247,9 +312,6 @@ final class OverlayWindowController: NSObject, ObservableObject {
         panel.overlayMenu = menu
         panel.hostingView = hostingView
         panel.contentView = hostingView
-        panel.level = settings.alwaysOnTop ? .floating : .normal
-        panel.alphaValue = settings.overlayOpacity
-        return panel
     }
 
     private func makeOverlayMenu(for windowID: CGWindowID) -> NSMenu {
@@ -567,14 +629,17 @@ extension OverlayWindowController: NSWindowDelegate, NSMenuDelegate {
 final class OverlayPanel: NSPanel {
     var windowIDValue: CGWindowID = 0
     var positionKey = ""
+    var ownerProcessIdentifier: pid_t = 0
+    var ownerIdentity = ""
     var overlayMenu: NSMenu?
     weak var hostingView: OverlayMenuHosting?
 
     // macOS 27: isMovableByWindowBackground no longer moves NSHostingView-backed
     // windows, so the panel moves itself from mouse events (PanelDragTracker).
-    // SwiftUI's overlay drag guard (PreviewCardView.didDragOverlay) still owns
-    // the drag-vs-activation race: mouse drags flow through the hosting view and
-    // suppress the button tap as before.
+    // Drag events consumed here never reach the hosting view, so the SwiftUI
+    // click-vs-drag guard cannot see the drag; instead the mouse-up that ends
+    // a real drag (beyond the click threshold) is swallowed, which keeps the
+    // hosted button from firing a window switch after a long-press drag.
     var dragTracker = PanelDragTracker()
 
     override var canBecomeKey: Bool { false }
@@ -596,7 +661,9 @@ final class OverlayPanel: NSPanel {
                 return
             }
         case .leftMouseUp:
+            let wasDrag = dragTracker.movedBeyondClickThreshold
             dragTracker.end()
+            if wasDrag { return }
         default:
             break
         }

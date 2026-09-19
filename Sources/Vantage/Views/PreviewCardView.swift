@@ -29,7 +29,11 @@ struct PreviewCardView: View {
     private var windowAspectRatio: CGFloat {
         let width = max(window.frame.width, 1)
         let height = max(window.frame.height, 1)
-        return min(max(width / height, 1), 3)
+        let raw = min(max(width / height, 1), 3)
+        // Quantize to 1/16 steps: while a game window is being resized, every
+        // refresh publishes a slightly different aspect and the whole grid
+        // reflows each cycle. Stepped values change at most a few times instead.
+        return (raw * 16).rounded() / 16
     }
 
     @ViewBuilder

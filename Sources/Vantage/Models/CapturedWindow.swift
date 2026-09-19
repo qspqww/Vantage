@@ -30,8 +30,9 @@ struct CapturedWindow: Identifiable {
     /// game-window resize change the key, so the saved-position table resurrected
     /// a different remembered origin per size and panels drifted when resizing.
     /// `instanceOrdinal` distinguishes identical windows (same pid + title);
-    /// it is derived from ascending windowID, so it survives both resizes and
-    /// window moves.
+    /// it is session-pinned per windowID by `WindowOrdinalAllocator` and held
+    /// across transient dropouts, so it survives resizes, moves, and window
+    /// recreation (fullscreen toggles).
     var overlayPositionKey: String {
         let identity = [
             bundleIdentifier ?? ownerName,

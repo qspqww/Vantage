@@ -51,4 +51,31 @@ final class PanelDragTrackerTests: XCTestCase {
         XCTAssertFalse(tracker.isDragging)
         XCTAssertNil(tracker.dragged(mouseLocationInWindow: NSPoint(x: 5, y: 5), currentOrigin: NSPoint(x: 0, y: 0)))
     }
+
+    func testMovementBeyondClickThresholdIsFlagged() {
+        var tracker = PanelDragTracker()
+        tracker.begin(mouseLocationInWindow: NSPoint(x: 10, y: 10), windowOrigin: NSPoint(x: 0, y: 0))
+        // Cursor screen starts at (10,10); move 6pt right.
+        _ = tracker.dragged(mouseLocationInWindow: NSPoint(x: 16, y: 10), currentOrigin: NSPoint(x: 0, y: 0))
+        XCTAssertTrue(tracker.movedBeyondClickThreshold)
+    }
+
+    func testMovementBelowClickThresholdIsNotFlagged() {
+        var tracker = PanelDragTracker()
+        tracker.begin(mouseLocationInWindow: NSPoint(x: 10, y: 10), windowOrigin: NSPoint(x: 0, y: 0))
+        // Small jitter (2pt) — a click with hand shake, not a drag.
+        _ = tracker.dragged(mouseLocationInWindow: NSPoint(x: 12, y: 10), currentOrigin: NSPoint(x: 0, y: 0))
+        XCTAssertFalse(tracker.movedBeyondClickThreshold)
+    }
+
+    func testClickThresholdFlagResetsOnNextBegin() {
+        var tracker = PanelDragTracker()
+        tracker.begin(mouseLocationInWindow: NSPoint(x: 10, y: 10), windowOrigin: NSPoint(x: 0, y: 0))
+        _ = tracker.dragged(mouseLocationInWindow: NSPoint(x: 30, y: 10), currentOrigin: NSPoint(x: 0, y: 0))
+        XCTAssertTrue(tracker.movedBeyondClickThreshold)
+
+        tracker.end()
+        tracker.begin(mouseLocationInWindow: NSPoint(x: 5, y: 5), windowOrigin: NSPoint(x: 0, y: 0))
+        XCTAssertFalse(tracker.movedBeyondClickThreshold)
+    }
 }

@@ -66,6 +66,11 @@ final class WindowCaptureService: ObservableObject {
     private var lastDiscoveryLog = Date.distantPast
     private var lastCandidateCount = -1
 
+    // Session-pinned instance ordinals: a window keeps its ordinal across
+    // transient dropouts (fullscreen toggle, empty title while loading), so
+    // overlay position keys — and their saved origins — survive recreation.
+    private var ordinalAllocator = WindowOrdinalAllocator()
+
     init(settings: SettingsStore) {
         self.settings = settings
     }
@@ -233,28 +238,6 @@ final class WindowCaptureService: ObservableObject {
         discoveryLog.info("discovered=\(discovered.count, privacy: .public) totalOnScreen=\(totalOnScreen, privacy: .public)")
     }
 
-    /// Stable instance ordinal per client instance: within the group sharing the
-    /// same (pid, title), windows are numbered by ascending windowID (creation
-    /// order). Independent of geometry and y/x position, so resizing or moving a
-    /// game window keeps its ordinal — and therefore its overlay position key —
-    /// unchanged. Static pure function so tests can feed fixtures.
-    nonisolated static func stableOrdinals(
-        entries: [(pid: pid_t, title: String, id: CGWindowID)]
-    ) -> [CGWindowID: Int] {
-        struct Key: Hashable { let pid: pid_t; let title: String }
-        var grouped: [Key: [CGWindowID]] = [:]
-        for e in entries {
-            grouped[Key(pid: e.pid, title: e.title), default: []].append(e.id)
-        }
-        var ordinals: [CGWindowID: Int] = [:]
-        for (_, ids) in grouped {
-            for (index, id) in ids.sorted().enumerated() {
-                ordinals[id] = index
-            }
-        }
-        return ordinals
-    }
-
     // MARK: - Refresh cycle
 
     func refresh() async {
@@ -406,10 +389,12 @@ final class WindowCaptureService: ObservableObject {
 
         // ---- Publish. List is always derived from this cycle's live enumeration,
         // so timestamps can never outrun the underlying truth (kills fake-update A).
-        // Ordinals are stable per client instance (ascending windowID inside its
-        // pid+title group), so resizing a game window no longer reshuffles keys.
-        let ordinals = Self.stableOrdinals(
-            entries: discovered.map { ($0.processIdentifier, $0.title, $0.windowID) }
+        // Ordinals are session-pinned per windowID (tombstoned across transient
+        // dropouts), so a window vanishing for one cycle no longer reshuffles
+        // the survivors' keys and jumps their overlay positions.
+        let ordinals = ordinalAllocator.assign(
+            entries: discovered.map { ($0.processIdentifier, $0.title, $0.windowID) },
+            now: Date.now
         )
         var nextWindows: [CapturedWindow] = []
         for window in discovered {
