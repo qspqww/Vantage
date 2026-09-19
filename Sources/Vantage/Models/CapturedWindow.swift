@@ -24,15 +24,20 @@ struct CapturedWindow: Identifiable {
         title.isEmpty ? L10n.string("window.fallbackTitle", language: language, values: ["id": "\(id)"]) : ownerName
     }
 
-    /// Stable while the application's duplicate-window ordering and geometry remain consistent.
+    /// Stable per client-instance identity used to persist overlay positions.
+    ///
+    /// Deliberately EXCLUDES window geometry: including width/height made every
+    /// game-window resize change the key, so the saved-position table resurrected
+    /// a different remembered origin per size and panels drifted when resizing.
+    /// `instanceOrdinal` distinguishes identical windows (same pid + title);
+    /// it is derived from ascending windowID, so it survives both resizes and
+    /// window moves.
     var overlayPositionKey: String {
         let identity = [
             bundleIdentifier ?? ownerName,
             ownerName,
             title,
-            String(instanceOrdinal),
-            String(Int(frame.width.rounded())),
-            String(Int(frame.height.rounded()))
+            String(instanceOrdinal)
         ].joined(separator: "\u{0}")
         return Data(identity.utf8).base64EncodedString()
     }

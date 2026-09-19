@@ -230,7 +230,9 @@ final class OverlayWindowController: NSObject, ObservableObject {
         panel.hasShadow = true
         panel.hidesOnDeactivate = false
         panel.becomesKeyOnlyIfNeeded = true
-        panel.isMovableByWindowBackground = true
+        // macOS 27: automatic background-move is broken for NSHostingView content;
+        // OverlayPanel moves itself via PanelDragTracker in sendEvent(_:).
+        panel.isMovableByWindowBackground = false
         panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary, .stationary]
         let hostingView = OverlayHostingView(
             rootView: OverlayThumbnailView(windowID: window.id)
@@ -568,8 +570,38 @@ final class OverlayPanel: NSPanel {
     var overlayMenu: NSMenu?
     weak var hostingView: OverlayMenuHosting?
 
+    // macOS 27: isMovableByWindowBackground no longer moves NSHostingView-backed
+    // windows, so the panel moves itself from mouse events (PanelDragTracker).
+    // SwiftUI's overlay drag guard (PreviewCardView.didDragOverlay) still owns
+    // the drag-vs-activation race: mouse drags flow through the hosting view and
+    // suppress the button tap as before.
+    var dragTracker = PanelDragTracker()
+
     override var canBecomeKey: Bool { false }
     override var canBecomeMain: Bool { false }
+
+    override func sendEvent(_ event: NSEvent) {
+        switch event.type {
+        case .leftMouseDown:
+            dragTracker.begin(
+                mouseLocationInWindow: event.locationInWindow,
+                windowOrigin: frame.origin
+            )
+        case .leftMouseDragged:
+            if let newOrigin = dragTracker.dragged(
+                mouseLocationInWindow: event.locationInWindow,
+                currentOrigin: frame.origin
+            ) {
+                setFrameOrigin(newOrigin)
+                return
+            }
+        case .leftMouseUp:
+            dragTracker.end()
+        default:
+            break
+        }
+        super.sendEvent(event)
+    }
 }
 
 @MainActor
