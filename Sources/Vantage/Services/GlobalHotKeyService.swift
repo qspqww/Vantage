@@ -17,7 +17,7 @@ private let hotKeyLog = Logger(subsystem: "dev.vantage.preview", category: "hotk
 @MainActor
 final class GlobalHotKeyService {
     enum Action {
-        case selectIndex(Int)
+        case selectSlot(Int)
         case nextClient
         case previousClient
     }
@@ -68,7 +68,7 @@ final class GlobalHotKeyService {
 
         var allSucceeded = true
         for (index, keyCode) in digitKeyCodes.enumerated() {
-            allSucceeded = allSucceeded && register(keyCode: keyCode, modifiers: cmd, action: .selectIndex(index))
+            allSucceeded = allSucceeded && register(keyCode: keyCode, modifiers: cmd, action: .selectSlot(index + 1))
         }
         allSucceeded = allSucceeded && register(keyCode: UInt32(kVK_ANSI_RightBracket), modifiers: cmdShift, action: .nextClient)
         allSucceeded = allSucceeded && register(keyCode: UInt32(kVK_ANSI_LeftBracket), modifiers: cmdShift, action: .previousClient)

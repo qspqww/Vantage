@@ -40,4 +40,14 @@ final class OverlayKeyTests: XCTestCase {
         XCTAssertNotEqual(first.overlayPositionKey, second.overlayPositionKey)
         XCTAssertNotEqual(first.overlayPositionKey, renamed.overlayPositionKey)
     }
+
+    func testOverlayPositionKeyIgnoresPIDToSurviveRelaunch() {
+        // The same client across relaunches has a different pid every launch;
+        // the identity must not include it or every restart orphans all saved
+        // positions and hotkey pins. Known trade-off: same-titled processes
+        // share the identity until their titles diverge.
+        let beforeRestart = window(id: 1, pid: 101, title: "Alice")
+        let afterRestart = window(id: 2, pid: 202, title: "Alice")
+        XCTAssertEqual(beforeRestart.overlayPositionKey, afterRestart.overlayPositionKey)
+    }
 }

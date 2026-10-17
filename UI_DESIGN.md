@@ -24,9 +24,9 @@ Vantage is a macOS window-switching workbench, not a dashboard. The first screen
 ```text
 Sidebar              Workspace                         Inspector (optional)
 Vantage              Window preview                    Overlay settings
-Search               count / state / refresh rate      Display
-Client list          compact object previews            Arrangement
-Refresh              empty / loading / error states
+Search               count / state / refresh rate      Hotkey order
+Client list          compact object previews           Display
+Refresh              empty / loading / error states    Arrangement
 ```
 
 ## Visual Direction
@@ -56,12 +56,13 @@ Native macOS utility surface: dark neutral zones, restrained blue selection, qui
 - Empty, loading, permission, and capture-error states each provide one direct next action.
 - Inspector is hidden by default so the repeated switching task gets the available width.
 - Floating preview size, opacity, and refresh rate remain in compact secondary menus.
+- ⌘N badges show the client's resolved hotkey slot, not its list position. Slot assignment stays in the Inspector's Hotkey Order group and in context menus (card, sidebar row, floating panel); it never adds controls to the primary switching surface.
 
 ## Responsive Behavior
 
-The preview grid uses a fixed maximum card width and adds columns only when they fit. At minimum size it collapses to one column; the sidebar and Inspector retain stable widths so controls never overlap.
+The preview grid picks the largest cards that fit every client inside the visible workspace: fewer columns make wider cards and taller rows, so the solver grows the column count only as far as the window height demands, capping cards at 420 px. Scrolling appears only when even minimum-size cards cannot fit the window height (many clients, short window). The sidebar and Inspector retain stable widths so controls never overlap.
 
-Preview images use proportional fit rather than fill-cropping. The main grid follows each captured window's real aspect ratio; floating panels keep a stable panel ratio and letterbox the image when needed, so window edges and controls remain visible.
+Preview images use proportional fit rather than fill-cropping. The main grid follows each captured window's real aspect ratio; floating panels keep a stable panel ratio and letterbox the image when needed, so window edges and controls remain visible. When every visible client shares one owner, the repeated owner subtitle is hidden from card footers.
 
 ## Language
 

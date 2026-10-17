@@ -3,8 +3,10 @@ import SwiftUI
 
 struct PreviewCardView: View {
     let window: CapturedWindow
-    let index: Int
     let compact: Bool
+    /// False hides the owner-name subtitle in the footer: when the whole
+    /// grid belongs to one application, repeating it per card is noise.
+    var showsOwnerSubtitle = true
 
     @EnvironmentObject private var captureService: WindowCaptureService
     @EnvironmentObject private var settings: SettingsStore
@@ -26,30 +28,26 @@ struct PreviewCardView: View {
         isActive
     }
 
-    private var windowAspectRatio: CGFloat {
-        let width = max(window.frame.width, 1)
-        let height = max(window.frame.height, 1)
-        let raw = min(max(width / height, 1), 3)
-        // Quantize to 1/16 steps: while a game window is being resized, every
-        // refresh publishes a slightly different aspect and the whole grid
-        // reflows each cycle. Stepped values change at most a few times instead.
-        return (raw * 16).rounded() / 16
-    }
-
     @ViewBuilder
     var body: some View {
         if compact {
             cardButton
         } else {
-            cardButton
-                .contextMenu {
-                    Button(settings.localized("menu.activateWindow")) {
-                        Task { await captureService.select(window.id) }
-                    }
-                    Button(settings.localized("menu.showOverlays")) {
-                        settings.showOverlays = true
-                    }
+            NativeContextMenu(
+                makeMenu: {
+                    WindowContextMenu.make(
+                        window: window,
+                        capture: captureService,
+                        settings: settings,
+                        includesOverlayToggle: true
+                    )
+                },
+                content: {
+                    cardButton
+                        .environmentObject(captureService)
+                        .environmentObject(settings)
                 }
+            )
         }
     }
 
@@ -75,7 +73,7 @@ struct PreviewCardView: View {
     private var mainCard: some View {
         VStack(alignment: .leading, spacing: 0) {
             previewImage
-                .aspectRatio(windowAspectRatio, contentMode: .fit)
+                .aspectRatio(window.displayAspectRatio, contentMode: .fit)
 
             HStack(alignment: .firstTextBaseline, spacing: 10) {
                 VStack(alignment: .leading, spacing: 3) {
@@ -83,16 +81,18 @@ struct PreviewCardView: View {
                         .font(.system(size: 11, weight: showsActiveHighlight || showsSelectedState ? .semibold : .medium))
                         .lineLimit(1)
                         .truncationMode(.middle)
-                    Text(window.subtitle(language: settings.language))
-                        .font(.system(size: 9))
-                        .foregroundStyle(VantageTheme.tertiaryText)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
+                    if showsOwnerSubtitle {
+                        Text(window.subtitle(language: settings.language))
+                            .font(.system(size: 9))
+                            .foregroundStyle(VantageTheme.tertiaryText)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                if index < 9 {
-                    Text("⌘\(index + 1)")
+                if let hotSlot = captureService.hotKeySlot(of: window.id) {
+                    Text("⌘\(hotSlot)")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(
                             showsActiveHighlight || showsSelectedState
@@ -146,8 +146,8 @@ struct PreviewCardView: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
 
-                if index < 9 {
-                    Text("⌘\(index + 1)")
+                if let hotSlot = captureService.hotKeySlot(of: window.id) {
+                    Text("⌘\(hotSlot)")
                         .font(.system(size: 8, weight: .medium, design: .monospaced))
                         .foregroundStyle(.white.opacity(0.78))
                 }
@@ -246,9 +246,8 @@ struct OverlayThumbnailView: View {
 
     var body: some View {
         Group {
-            if let window = captureService.window(withID: windowID),
-               let index = captureService.windows.firstIndex(where: { $0.id == windowID }) {
-                PreviewCardView(window: window, index: index, compact: true)
+            if let window = captureService.window(withID: windowID) {
+                PreviewCardView(window: window, compact: true)
             } else {
                 Color.clear
             }

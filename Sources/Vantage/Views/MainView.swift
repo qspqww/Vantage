@@ -80,13 +80,12 @@ struct MainView: View {
             guard press.modifiers.contains(.command),
                   let number = Int(press.characters),
                   (1...9).contains(number),
-                  filteredWindows.indices.contains(number - 1)
+                  let window = captureService.window(atHotKeySlot: number)
             else {
                 return .ignored
             }
 
-            let id = filteredWindows[number - 1].id
-            Task { await captureService.select(id) }
+            Task { await captureService.select(window.id) }
             return .handled
         }
         .alert(
@@ -169,7 +168,15 @@ struct MainView: View {
                 emptyView
             } else {
                 GeometryReader { proxy in
-                    let layout = previewLayout(for: proxy.size.width)
+                    // Tallest aspect (smallest ratio) drives the fit estimate:
+                    // every card in every row is then guaranteed to fit.
+                    let minAspect = filteredWindows.map(\.displayAspectRatio).min() ?? CGFloat(16) / 9
+                    let layout = PreviewGridSolver.solve(
+                        width: proxy.size.width,
+                        height: proxy.size.height,
+                        count: filteredWindows.count,
+                        minAspect: minAspect
+                    )
 
                     ScrollView {
                         LazyVStack(alignment: .leading, spacing: 14) {
@@ -179,12 +186,26 @@ struct MainView: View {
                                         let index = row * layout.columnCount + column
 
                                         if filteredWindows.indices.contains(index) {
+                                            // Width AND height pinned: lazy
+                                            // stacks measure with unbounded
+                                            // height, and an unpinned card
+                                            // falls back to the preview
+                                            // image's natural pixel height,
+                                            // inflating rows by hundreds of
+                                            // points (giant gaps, pushed-off
+                                            // second row).
                                             PreviewCardView(
                                                 window: filteredWindows[index],
-                                                index: index,
-                                                compact: false
+                                                compact: false,
+                                                showsOwnerSubtitle: showsOwnerSubtitle
                                             )
-                                            .frame(width: layout.cardWidth)
+                                            .frame(
+                                                width: layout.cardWidth,
+                                                height: PreviewGridSolver.cardHeight(
+                                                    cardWidth: layout.cardWidth,
+                                                    aspect: filteredWindows[index].displayAspectRatio
+                                                )
+                                            )
                                             .clipped()
                                         } else {
                                             Color.clear
@@ -205,30 +226,10 @@ struct MainView: View {
         .frame(maxWidth: .infinity, maxHeight: .infinity)
     }
 
-    private func previewLayout(for width: CGFloat) -> PreviewGridLayout {
-        let availableWidth = max(1, width - 28)
-        let preferredCardWidth = 250.0
-        let gap = 12.0
-        let fittingColumnCount = max(
-            1,
-            Int(floor((availableWidth + gap) / (preferredCardWidth + gap)))
-        )
-        let columnCount = min(max(1, filteredWindows.count), fittingColumnCount)
-        let gapsWidth = Double(max(0, columnCount - 1)) * gap
-        let cardWidth = min(
-            preferredCardWidth,
-            floor((availableWidth - gapsWidth) / Double(columnCount))
-        )
-        let contentWidth = Double(columnCount) * cardWidth + gapsWidth
-        let rowCount = Int(ceil(Double(filteredWindows.count) / Double(columnCount)))
-
-        return PreviewGridLayout(
-            columnCount: columnCount,
-            rowCount: rowCount,
-            cardWidth: cardWidth,
-            contentWidth: contentWidth,
-            gap: gap
-        )
+    /// Every card repeating one identical owner name is noise, not metadata:
+    /// hide the subtitle when the whole filtered set belongs to one owner.
+    private var showsOwnerSubtitle: Bool {
+        Set(filteredWindows.map(\.ownerName)).count > 1
     }
 
     private var permissionView: some View {
@@ -400,12 +401,4 @@ struct MainView: View {
     private func localized(_ key: String, values: [String: String] = [:]) -> String {
         settings.localized(key, values: values)
     }
-}
-
-private struct PreviewGridLayout {
-    let columnCount: Int
-    let rowCount: Int
-    let cardWidth: CGFloat
-    let contentWidth: CGFloat
-    let gap: CGFloat
 }

@@ -43,6 +43,28 @@ struct InspectorView: View {
                     }
                 }
 
+                inspectorGroup(settings.localized("inspector.hotkeys")) {
+                    Text(settings.localized("inspector.hotkeysHelp"))
+                        .font(.system(size: 9))
+                        .foregroundStyle(VantageTheme.tertiaryText)
+
+                    if captureService.windows.isEmpty {
+                        Text(settings.localized("inspector.hotkeysEmpty"))
+                            .foregroundStyle(VantageTheme.tertiaryText)
+                    } else {
+                        ForEach(captureService.windows) { window in
+                            HotKeyRow(
+                                windowID: window.id,
+                                displayTitle: window.displayTitle,
+                                subtitleText: window.subtitle(language: settings.language),
+                                positionKey: window.overlayPositionKey,
+                                assignment: settings.hotKeyAssignments[window.overlayPositionKey]
+                            )
+                            .equatable()
+                        }
+                    }
+                }
+
                 inspectorGroup(settings.localized("inspector.arrangement")) {
                     Picker(settings.localized("inspector.arrangement"), selection: $settings.previewLayout) {
                         ForEach(PreviewLayout.allCases) { layout in
@@ -116,6 +138,62 @@ struct InspectorView: View {
             }
             Slider(value: value, in: range)
                 .tint(settings.accentChoice.color)
+        }
+    }
+
+    /// Value-only row. Equatable gating is what keeps the picker popup
+    /// stable: the capture stream republishes `windows` every refresh cycle
+    /// (new thumbnail images), and without the gate each cycle would rebuild
+    /// the Picker under an open popup menu.
+    private struct HotKeyRow: View, Equatable {
+        let windowID: CGWindowID
+        let displayTitle: String
+        let subtitleText: String
+        let positionKey: String
+        let assignment: Int?
+
+        @EnvironmentObject private var settings: SettingsStore
+
+        nonisolated static func == (lhs: HotKeyRow, rhs: HotKeyRow) -> Bool {
+            lhs.windowID == rhs.windowID
+                && lhs.displayTitle == rhs.displayTitle
+                && lhs.subtitleText == rhs.subtitleText
+                && lhs.positionKey == rhs.positionKey
+                && lhs.assignment == rhs.assignment
+        }
+
+        /// Shows the persisted pin (nil = auto). The ⌘N badge in the sidebar
+        /// and cards shows the *resolved* slot instead; the two differ exactly
+        /// when a window is auto-filling whatever slot happens to be free.
+        var body: some View {
+            HStack {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(displayTitle)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(subtitleText)
+                        .font(.system(size: 9))
+                        .foregroundStyle(VantageTheme.tertiaryText)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+
+                Picker(
+                    settings.localized("menu.assignHotkey"),
+                    selection: Binding(
+                        get: { assignment },
+                        set: { settings.setHotKeySlot($0, for: positionKey) }
+                    )
+                ) {
+                    Text(settings.localized("hotkey.auto")).tag(Int?.none)
+                    ForEach(1...HotKeySlotResolver.slotCount, id: \.self) { slot in
+                        Text("⌘\(slot)").tag(Int?.some(slot))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+            }
         }
     }
 

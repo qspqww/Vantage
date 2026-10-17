@@ -16,6 +16,18 @@ struct CapturedWindow: Identifiable {
         title.isEmpty ? ownerName : title
     }
 
+    /// Quantized 1/16-step display aspect (clamped 1...3). Shared by the card
+    /// renderer, the grid solver, and the row-height calculation so all three
+    /// agree exactly: the grid pins each card's height to width / this value,
+    /// which keeps lazy container measurement from inflating rows to the
+    /// preview image's natural pixel height.
+    var displayAspectRatio: CGFloat {
+        let width = max(frame.width, 1)
+        let height = max(frame.height, 1)
+        let raw = min(max(width / height, 1), 3)
+        return (raw * 16).rounded() / 16
+    }
+
     var subtitle: String {
         ownerName
     }
@@ -24,15 +36,22 @@ struct CapturedWindow: Identifiable {
         title.isEmpty ? L10n.string("window.fallbackTitle", language: language, values: ["id": "\(id)"]) : ownerName
     }
 
-    /// Stable per client-instance identity used to persist overlay positions.
+    /// Stable per client-instance identity used to persist overlay positions
+    /// and hotkey slot assignments.
     ///
     /// Deliberately EXCLUDES window geometry: including width/height made every
     /// game-window resize change the key, so the saved-position table resurrected
     /// a different remembered origin per size and panels drifted when resizing.
-    /// `instanceOrdinal` distinguishes identical windows (same pid + title);
-    /// it is session-pinned per windowID by `WindowOrdinalAllocator` and held
-    /// across transient dropouts, so it survives resizes, moves, and window
-    /// recreation (fullscreen toggles).
+    /// Deliberately EXCLUDES the process id: pids change on every client
+    /// relaunch, so a pid-bearing key loses all saved positions and hotkey pins
+    /// each restart. Known trade-off: separate processes that share bundle,
+    /// owner, AND exact title collapse onto one identity (one steals the
+    /// other's slot/origin) until their titles diverge — multiboxed clients
+    /// typically disambiguate once character names load into window titles.
+    /// `instanceOrdinal` distinguishes windows WITHIN one process (same pid +
+    /// title); it is session-pinned per windowID by `WindowOrdinalAllocator`
+    /// and held across transient dropouts, so it survives resizes, moves, and
+    /// window recreation (fullscreen toggles).
     var overlayPositionKey: String {
         let identity = [
             bundleIdentifier ?? ownerName,

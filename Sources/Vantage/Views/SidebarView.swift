@@ -28,8 +28,8 @@ struct SidebarView: View {
 
             ScrollView {
                 LazyVStack(spacing: 1) {
-                    ForEach(Array(filteredWindows.enumerated()), id: \.element.id) { index, window in
-                        clientRow(window: window, index: index)
+                    ForEach(filteredWindows) { window in
+                        clientRow(window: window)
                     }
                 }
                 .padding(.horizontal, 6)
@@ -98,11 +98,29 @@ struct SidebarView: View {
         .padding(.horizontal, 12)
     }
 
-    private func clientRow(window: CapturedWindow, index: Int) -> some View {
+    private func clientRow(window: CapturedWindow) -> some View {
         let isSelected = captureService.selectedWindowID == window.id
         let isActive = captureService.activeWindowID == window.id
 
-        return Button {
+        return NativeContextMenu(
+            makeMenu: {
+                WindowContextMenu.make(
+                    window: window,
+                    capture: captureService,
+                    settings: settings,
+                    includesOverlayToggle: false
+                )
+            },
+            content: {
+                rowLabel(window: window, isSelected: isSelected, isActive: isActive)
+                    .environmentObject(captureService)
+                    .environmentObject(settings)
+            }
+        )
+    }
+
+    private func rowLabel(window: CapturedWindow, isSelected: Bool, isActive: Bool) -> some View {
+        Button {
             Task { await captureService.select(window.id) }
         } label: {
             HStack(spacing: 8) {
@@ -131,8 +149,8 @@ struct SidebarView: View {
                         .accessibilityLabel(settings.localized("window.active"))
                 }
 
-                if index < 9 {
-                    Text("⌘\(index + 1)")
+                if let hotSlot = captureService.hotKeySlot(of: window.id) {
+                    Text("⌘\(hotSlot)")
                         .font(.system(size: 9, weight: .medium, design: .monospaced))
                         .foregroundStyle(isActive || isSelected ? settings.accentChoice.color : VantageTheme.tertiaryText)
                 }

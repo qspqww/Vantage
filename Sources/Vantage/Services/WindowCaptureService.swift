@@ -477,10 +477,38 @@ final class WindowCaptureService: ObservableObject {
     }
 
     func selectRelative(_ offset: Int) async {
-        guard !windows.isEmpty else { return }
-        let currentIndex = windows.firstIndex { $0.id == selectedWindowID } ?? 0
-        let nextIndex = (currentIndex + offset + windows.count) % windows.count
-        await select(windows[nextIndex].id)
+        // Cycle in hotkey-slot order so ⌘⇧]/⌘⇧[ step through the same
+        // sequence the number keys address.
+        let ordered = HotKeySlotResolver.orderedWindows(windows, assignments: settings.hotKeyAssignments)
+        guard !ordered.isEmpty else { return }
+        let currentIndex = ordered.firstIndex { $0.id == selectedWindowID } ?? 0
+        let nextIndex = (currentIndex + offset + ordered.count) % ordered.count
+        await select(ordered[nextIndex].id)
+    }
+
+    // MARK: - Hotkey slots
+
+    /// WindowID occupying each ⌘1-9 slot (index 0 = ⌘1); nil when empty.
+    func resolvedHotKeySlots() -> [CGWindowID?] {
+        HotKeySlotResolver.resolve(windows: windows, assignments: settings.hotKeyAssignments)
+    }
+
+    /// The window a ⌘N shortcut currently addresses.
+    func window(atHotKeySlot slot: Int) -> CapturedWindow? {
+        guard (1...HotKeySlotResolver.slotCount).contains(slot),
+              let id = resolvedHotKeySlots()[slot - 1] else { return nil }
+        return window(withID: id)
+    }
+
+    /// Resolved 1-based slot shown in badges; nil when the window has none.
+    func hotKeySlot(of windowID: CGWindowID) -> Int? {
+        HotKeySlotResolver.slot(of: windowID, windows: windows, assignments: settings.hotKeyAssignments)
+    }
+
+    @discardableResult
+    func selectHotKeySlot(_ slot: Int) async -> Bool {
+        guard let window = window(atHotKeySlot: slot) else { return false }
+        return await select(window.id)
     }
 
     func window(withID id: CGWindowID) -> CapturedWindow? {

@@ -1,6 +1,9 @@
 import AppKit
 import Combine
+import os.log
 import SwiftUI
+
+private let overlayDiagLog = Logger(subsystem: "dev.vantage.preview", category: "overlay-diag")
 
 @MainActor
 final class OverlayWindowController: NSObject, ObservableObject {
@@ -13,6 +16,17 @@ final class OverlayWindowController: NSObject, ObservableObject {
     // rebinding the same panel preserves its position and drag/hover state.
     private var missingPanels: [CGWindowID: (panel: OverlayPanel, since: Date)] = [:]
     private let missingPanelGrace: TimeInterval = 4.0
+    // Windows must be continuously present for this long before earning a
+    // panel: focus switches (Alt-Tab) make games spawn brief helper windows
+    // that pass all filters, and creating panels for them pops panels in at
+    // default slots for a fraction of a second.
+    private var pendingNewWindows: [CGWindowID: Date] = [:]
+    private let newWindowSettleDelay: TimeInterval = 0.5
+    // A changed position key must stay stable this long before the panel
+    // migrates to the new key's remembered origin: app switches can make a
+    // window's title flip-flop, and without the delay the panel ping-pongs
+    // between the two titles' saved positions on every Alt-Tab.
+    private let positionKeyStabilityDelay: TimeInterval = 1.0
     private var cancellables: Set<AnyCancellable> = []
     private var isApplyingLayout = false
     private var isApplyingMenuSetting = false
@@ -184,45 +198,40 @@ final class OverlayWindowController: NSObject, ObservableObject {
             missingPanels[id] = nil
         }
 
+        // Windows that vanished before settling never earned a panel.
+        pendingNewWindows = pendingNewWindows.filter { validIDs.contains($0.key) }
+
         var newPanels: [OverlayPanel] = []
         for window in windows {
             if let panel = panels[window.id] {
-                let oldKey = panel.positionKey
                 let newKey = window.overlayPositionKey
-                if oldKey != newKey {
-                    panel.positionKey = newKey
-                    // Character name appears later: existing panel title changed from placeholder to character name, migrate back to saved position.
-                    if let origin = settings.savedOverlayOrigin(for: newKey) {
-                        guard let screen = screenFor(origin: NSPoint(x: origin.x, y: origin.y)) ?? NSScreen.main else {
-                            continue
-                        }
-                        let size = NSSize(width: settings.previewWidth, height: settings.previewWidth * 0.625)
-                        let targetFrame = clampedFrame(
-                            origin: NSPoint(x: origin.x, y: origin.y),
-                            size: size,
-                            within: screen.visibleFrame
-                        )
-                        if hypot(panel.frame.origin.x - targetFrame.origin.x,
-                                  panel.frame.origin.y - targetFrame.origin.y) > 8 {
-                            isApplyingLayout = true
-                            panel.setFrame(targetFrame, display: true, animate: true)
-                            isApplyingLayout = false
-                            savePosition(of: panel, origin: targetFrame.origin)
-                        }
-                    } else {
-                        // First occurrence of new title: keep current position and persist for next launch.
-                        savePosition(of: panel, origin: panel.frame.origin)
+                if panel.positionKey != newKey {
+                    if panel.pendingPositionKey != newKey {
+                        panel.pendingPositionKey = newKey
+                        panel.pendingKeySince = now
                     }
+                    if now.timeIntervalSince(panel.pendingKeySince) >= positionKeyStabilityDelay {
+                        panel.pendingPositionKey = nil
+                        migratePanel(panel, to: newKey)
+                    }
+                    // Unstable key (title flip-flop on app switch): keep the
+                    // panel where it is until the new identity settles.
                 } else {
-                    panel.positionKey = newKey
+                    panel.pendingPositionKey = nil
                 }
             } else if let rebound = takeMissingPanel(for: window) {
+                pendingNewWindows[window.id] = nil
                 rebind(rebound, to: window)
                 panels[window.id] = rebound
+            } else if let firstSeen = pendingNewWindows[window.id] {
+                if now.timeIntervalSince(firstSeen) >= newWindowSettleDelay {
+                    pendingNewWindows[window.id] = nil
+                    let panel = makePanel(for: window)
+                    panels[window.id] = panel
+                    newPanels.append(panel)
+                }
             } else {
-                let panel = makePanel(for: window)
-                panels[window.id] = panel
-                newPanels.append(panel)
+                pendingNewWindows[window.id] = now
             }
         }
 
@@ -253,12 +262,41 @@ final class OverlayWindowController: NSObject, ObservableObject {
         return only.value.panel
     }
 
+    /// Commits a position-key change that has stayed stable long enough:
+    /// migrate to the new identity's remembered origin (character name
+    /// resolved, per-identity layout), or adopt the current spot when the
+    /// identity has never been seen so the panel does not move at all.
+    private func migratePanel(_ panel: OverlayPanel, to newKey: String) {
+        panel.positionKey = newKey
+        guard let origin = settings.savedOverlayOrigin(for: newKey) else {
+            savePosition(of: panel, origin: panel.frame.origin)
+            return
+        }
+        guard let screen = screenFor(origin: NSPoint(x: origin.x, y: origin.y)) ?? NSScreen.main else {
+            return
+        }
+        let size = NSSize(width: settings.previewWidth, height: settings.previewWidth * 0.625)
+        let targetFrame = clampedFrame(
+            origin: NSPoint(x: origin.x, y: origin.y),
+            size: size,
+            within: screen.visibleFrame
+        )
+        if hypot(panel.frame.origin.x - targetFrame.origin.x,
+                  panel.frame.origin.y - targetFrame.origin.y) > 8 {
+            isApplyingLayout = true
+            panel.setFrame(targetFrame, display: true, animate: true)
+            isApplyingLayout = false
+            savePosition(of: panel, origin: targetFrame.origin)
+        }
+    }
+
     /// Revives a limbo panel for a new windowID without touching its frame:
     /// the panel reappears exactly where it was instead of flying in from a
     /// default slot. Content and menu are rebuilt because both bind the ID.
     private func rebind(_ panel: OverlayPanel, to window: CapturedWindow) {
         panel.windowIDValue = window.id
         panel.positionKey = window.overlayPositionKey
+        panel.pendingPositionKey = nil
         panel.ownerProcessIdentifier = window.processIdentifier
         panel.ownerIdentity = window.bundleIdentifier ?? window.ownerName
         attachContent(to: panel, for: window)
@@ -327,6 +365,8 @@ final class OverlayWindowController: NSObject, ObservableObject {
         activateItem.target = self
         activateItem.representedObject = NSNumber(value: windowID)
         menu.addItem(activateItem)
+
+        menu.addItem(hotKeySlotSubmenu(for: windowID))
         menu.addItem(.separator())
 
         menu.addItem(submenuItem(
@@ -373,6 +413,58 @@ final class OverlayWindowController: NSObject, ObservableObject {
         return menu
     }
 
+    /// "Hotkey" submenu: pins this panel's client to a ⌘1-9 slot or releases
+    /// it to auto. State marks reflect the *resolved* slot (what ⌘N does
+    /// right now). Unlike the other setting submenus they cannot rely on
+    /// menuWillOpen alone: the marks must be correct at BUILD time, because
+    /// adding a checkmark to an already-displayed submenu relayouts it (the
+    /// state column appears) and the whole submenu visibly flickers.
+    private func hotKeySlotSubmenu(for windowID: CGWindowID) -> NSMenuItem {
+        overlayDiagLog.info("hotkey submenu built windowID=\(windowID)")
+        let title = settings.localized("menu.assignHotkey")
+        let rootItem = NSMenuItem(title: title, action: nil, keyEquivalent: "")
+        let submenu = NSMenu(title: title)
+        submenu.autoenablesItems = false
+
+        let currentSlot = HotKeySlotResolver.slot(
+            of: windowID,
+            windows: captureService.windows,
+            assignments: settings.hotKeyAssignments
+        )
+
+        let autoItem = NSMenuItem(
+            title: settings.localized("hotkey.auto"),
+            action: #selector(setHotKeySlotFromMenu(_:)),
+            keyEquivalent: ""
+        )
+        autoItem.target = self
+        autoItem.representedObject = NSDictionary(dictionary: [
+            "windowID": NSNumber(value: windowID),
+            "slot": NSNumber(value: 0)
+        ])
+        autoItem.state = currentSlot == nil ? .on : .off
+        submenu.addItem(autoItem)
+        submenu.addItem(.separator())
+
+        for slot in 1...HotKeySlotResolver.slotCount {
+            let item = NSMenuItem(
+                title: "⌘\(slot)",
+                action: #selector(setHotKeySlotFromMenu(_:)),
+                keyEquivalent: ""
+            )
+            item.target = self
+            item.representedObject = NSDictionary(dictionary: [
+                "windowID": NSNumber(value: windowID),
+                "slot": NSNumber(value: slot)
+            ])
+            item.state = currentSlot == slot ? .on : .off
+            submenu.addItem(item)
+        }
+
+        rootItem.submenu = submenu
+        return rootItem
+    }
+
     private func submenuItem(
         title: String,
         values: [Double],
@@ -401,6 +493,26 @@ final class OverlayWindowController: NSObject, ObservableObject {
         let windowID = CGWindowID(number.uint32Value)
         Task { [weak self] in
             await self?.captureService.select(windowID)
+        }
+    }
+
+    @objc private func setHotKeySlotFromMenu(_ sender: NSMenuItem) {
+        overlayDiagLog.info("setHotKeySlotFromMenu enter title=\(sender.title, privacy: .public)")
+        guard let info = sender.representedObject as? NSDictionary,
+              let windowIDNumber = info["windowID"] as? NSNumber,
+              let slotNumber = info["slot"] as? NSNumber
+        else {
+            overlayDiagLog.error("setHotKeySlotFromMenu payload cast failed")
+            return
+        }
+        guard let window = captureService.window(withID: CGWindowID(windowIDNumber.uint32Value)) else {
+            overlayDiagLog.error("setHotKeySlotFromMenu window not in list id=\(windowIDNumber.uint32Value)")
+            return
+        }
+        let slot = slotNumber.intValue
+        overlayDiagLog.info("setHotKeySlotFromMenu dispatch slot=\(slot) windowID=\(windowIDNumber.uint32Value)")
+        DispatchQueue.main.async { [weak self] in
+            self?.settings.setHotKeySlot(slot == 0 ? nil : slot, for: window.overlayPositionKey)
         }
     }
 
@@ -505,6 +617,7 @@ final class OverlayWindowController: NSObject, ObservableObject {
 
     private func applyVisibility() {
         let shouldShow = settings.showOverlays && (!NSApp.isActive || isOverlayMenuOpen)
+        overlayDiagLog.info("applyVisibility show=\(shouldShow) appActive=\(NSApp.isActive) menuOpen=\(self.isOverlayMenuOpen) panels=\(self.panels.count)")
         for panel in panels.values {
             if shouldShow {
                 panel.orderFrontRegardless()
@@ -531,14 +644,42 @@ final class OverlayWindowController: NSObject, ObservableObject {
         }
     }
 
+    /// Hotkey submenu items carry windowID + slot in a dictionary rather than
+    /// a plain NSNumber, so their state is refreshed separately from the other
+    /// setting submenus.
+    private func updateHotKeyMenuState(_ menu: NSMenu) {
+        for item in menu.items {
+            if let submenu = item.submenu {
+                updateHotKeyMenuState(submenu)
+            }
+
+            guard item.action == #selector(setHotKeySlotFromMenu(_:)),
+                  let info = item.representedObject as? NSDictionary,
+                  let windowIDNumber = info["windowID"] as? NSNumber,
+                  let slotNumber = info["slot"] as? NSNumber
+            else { continue }
+
+            let current = HotKeySlotResolver.slot(
+                of: CGWindowID(windowIDNumber.uint32Value),
+                windows: captureService.windows,
+                assignments: settings.hotKeyAssignments
+            )
+            let slotValue = slotNumber.intValue
+            item.state = (slotValue == 0 ? current == nil : current == slotValue) ? .on : .off
+        }
+    }
+
     private func beginOverlayMenu(_ menu: NSMenu) {
+        overlayDiagLog.info("beginOverlayMenu")
         wasApplicationActiveBeforeMenu = NSApp.isActive
         isOverlayMenuOpen = true
         updateMenuState(menu)
+        updateHotKeyMenuState(menu)
         applyVisibility()
     }
 
     private func endOverlayMenu() {
+        overlayDiagLog.info("endOverlayMenu appActive=\(NSApp.isActive) wasActiveBefore=\(self.wasApplicationActiveBeforeMenu)")
         isOverlayMenuOpen = false
 
         if !wasApplicationActiveBeforeMenu, NSApp.isActive {
@@ -617,10 +758,13 @@ extension OverlayWindowController: NSWindowDelegate, NSMenuDelegate {
     }
 
     func menuWillOpen(_ menu: NSMenu) {
+        overlayDiagLog.info("menuWillOpen title='\(menu.title, privacy: .public)' items=\(menu.items.count)")
         updateMenuState(menu)
+        updateHotKeyMenuState(menu)
     }
 
     func menuDidClose(_ menu: NSMenu) {
+        overlayDiagLog.info("menuDidClose title='\(menu.title, privacy: .public)'")
         endOverlayMenu()
     }
 
@@ -629,6 +773,10 @@ extension OverlayWindowController: NSWindowDelegate, NSMenuDelegate {
 final class OverlayPanel: NSPanel {
     var windowIDValue: CGWindowID = 0
     var positionKey = ""
+    /// A changed identity being observed for stability before the panel
+    /// migrates to its remembered origin (guards against title flip-flop).
+    var pendingPositionKey: String?
+    var pendingKeySince = Date.distantPast
     var ownerProcessIdentifier: pid_t = 0
     var ownerIdentity = ""
     var overlayMenu: NSMenu?

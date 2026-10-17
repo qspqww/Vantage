@@ -82,9 +82,8 @@ final class GlobalHotKeyServiceHolder: ObservableObject {
             guard let self, let capture = self.captureService else { return }
             Task { @MainActor in
                 switch action {
-                case .selectIndex(let index):
-                    guard capture.windows.indices.contains(index) else { return }
-                    await capture.select(capture.windows[index].id)
+                case .selectSlot(let slot):
+                    await capture.selectHotKeySlot(slot)
                 case .nextClient:
                     await capture.selectRelative(1)
                 case .previousClient:
@@ -108,12 +107,23 @@ struct VantageCommands: Commands {
     var body: some Commands {
         CommandMenu(settings.localized("menu.clients")) {
             ForEach(1...9, id: \.self) { number in
-                Button(settings.localized("menu.switchClient", values: ["number": "\(number)"])) {
-                    guard captureService.windows.indices.contains(number - 1) else { return }
-                    let id = captureService.windows[number - 1].id
-                    Task { await captureService.select(id) }
+                // Label names the pinned client so the adjustable order is
+                // visible right in the menu; an empty slot is honestly inert.
+                if let window = captureService.window(atHotKeySlot: number) {
+                    Button(
+                        settings.localized(
+                            "menu.switchClientWithTitle",
+                            values: ["number": "\(number)", "window": window.displayTitle]
+                        )
+                    ) {
+                        Task { await captureService.selectHotKeySlot(number) }
+                    }
+                    .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: [.command])
+                } else {
+                    Button(settings.localized("menu.switchClient", values: ["number": "\(number)"])) {}
+                        .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: [.command])
+                        .disabled(true)
                 }
-                .keyboardShortcut(KeyEquivalent(Character(String(number))), modifiers: [.command])
             }
 
             Divider()

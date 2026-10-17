@@ -1,4 +1,7 @@
 import Foundation
+import os.log
+
+private let settingsDiagLog = Logger(subsystem: "dev.vantage.preview", category: "settings-diag")
 
 struct SavedOverlayPosition: Codable, Equatable {
     let x: Double
@@ -26,6 +29,7 @@ final class SettingsStore: ObservableObject {
         static let showMetadata = "showMetadata"
         static let language = "language"
         static let overlayPositions = "overlayPositions"
+        static let hotKeyAssignments = "hotKeyAssignments"
     }
 
     private let defaults: UserDefaults
@@ -80,6 +84,10 @@ final class SettingsStore: ObservableObject {
 
     @Published var isPaused = false
 
+    /// Pinned ⌘1-9 slot per client identity (`CapturedWindow.overlayPositionKey`).
+    /// Missing entry = auto: the window fills a free slot in list order.
+    @Published private(set) var hotKeyAssignments: [String: Int]
+
     private var overlayPositions: [String: SavedOverlayPosition]
 
     var exactBundleIdentifierList: [String] {
@@ -105,7 +113,8 @@ final class SettingsStore: ObservableObject {
             Key.accentChoice: AccentChoice.blue.rawValue,
             Key.showMetadata: true,
             Key.language: AppLanguage.systemDefault.rawValue,
-            Key.overlayPositions: Data()
+            Key.overlayPositions: Data(),
+            Key.hotKeyAssignments: Data()
         ])
 
         exactBundleIdentifiers = defaults.string(forKey: Key.exactBundleIdentifiers) ?? ""
@@ -128,6 +137,33 @@ final class SettingsStore: ObservableObject {
             overlayPositions = decoded
         } else {
             overlayPositions = [:]
+        }
+        if let data = defaults.data(forKey: Key.hotKeyAssignments),
+           let decoded = try? JSONDecoder().decode([String: Int].self, from: data) {
+            hotKeyAssignments = decoded
+        } else {
+            hotKeyAssignments = [:]
+        }
+    }
+
+    /// Pins a client identity to a ⌘1-9 slot (nil = auto). One client per
+    /// slot: pinning an occupied slot releases the previous holder to auto.
+    func setHotKeySlot(_ slot: Int?, for key: String) {
+        var diagMessage = "setHotKeySlot slot=\(slot.map(String.init) ?? "nil")"
+        if let slot, (1...HotKeySlotResolver.slotCount).contains(slot) {
+            let released = hotKeyAssignments.filter { $0.value == slot && $0.key != key }
+            for identity in released.keys {
+                hotKeyAssignments[identity] = nil
+            }
+            hotKeyAssignments[key] = slot
+            diagMessage += " pinned released=\(released.count)"
+        } else {
+            hotKeyAssignments[key] = nil
+            diagMessage += " cleared"
+        }
+        settingsDiagLog.info("\(diagMessage, privacy: .public)")
+        if let data = try? JSONEncoder().encode(hotKeyAssignments) {
+            defaults.set(data, forKey: Key.hotKeyAssignments)
         }
     }
 

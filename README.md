@@ -22,12 +22,12 @@ Vantage is a native macOS SwiftUI utility for monitoring and switching between m
 - Can switch to the corresponding client automatically when a floating preview is clicked; the preview remains non-activating so another preview can switch back with one click.
 - Floating previews expose right-click menus for common size and opacity presets; dragging a panel does not activate its client.
 - Supports grid, vertical, and horizontal overlay arrangements.
-- Uses compact, fixed-width main previews that add columns as space allows without stretching cards into the Inspector.
+- Sizes the main preview grid to fit every discovered client on screen when space allows: cards grow up to 420 px before extra columns are added, and only scroll to a second screenful when minimum-size cards cannot fit the window height. The owner subtitle is hidden when every visible client belongs to the same application.
 - Uses a restrained macOS utility palette: neutral surfaces, one selected accent, and status colors only for success, warning, and error.
 - Uses a task-focused workspace layout with a sidebar, preview grid, and optional collapsed Inspector; decorative grid backgrounds and duplicate metadata are intentionally omitted.
 - Persists opacity, preview size, refresh rate, layout, accent, metadata, exact application identity filters, and draggable floating-preview positions.
 - Supports runtime switching between English and Simplified Chinese from Settings; all application labels, menus, statuses, and activation errors use the selected language.
-- Provides native menu commands and `Command + 1-9` window switching.
+- Provides native menu commands and `Command + 1-9` window switching. Each client can be pinned to a ⌘1-9 slot (Inspector, card/sidebar context menus, or a floating panel's context menu); unpinned clients fill the remaining slots in list order, and `⌘⇧]` / `⌘⇧[` cycle through the same order.
 - Protects against stale asynchronous refresh results when the user refreshes or changes filters quickly.
 - Keeps the empty state stable during background refreshes; the loading view is shown only for the initial scan.
 - Offers direct links to the exact macOS Privacy & Security panels needed for Screen Recording and Accessibility.
